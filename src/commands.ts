@@ -97,4 +97,10 @@ export const commands = [
 			.required()
 			.max_length(300),
 	),
+	// Manage Server only (permission bit 0x20) — a moderation tool for retrying
+	// a failed daily post, hidden from regular members.
+	new Command(
+		"wotd",
+		"Post today's word of the day now (retry after a failed cron run)",
+	).default_member_permissions("32"),
 ];

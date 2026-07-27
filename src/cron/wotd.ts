@@ -6,7 +6,8 @@
  * have silently matched both, so both are now registered by their exact
  * cron string.) The whole pick/filter/probe algorithm is decomposed into
  * pure functions (unit-tested in test/wotd-pick.test.ts) around a thin I/O
- * shell (`runWotd`) that:
+ * shell (`postWotd`, shared with the `/wotd` manual-trigger command in
+ * src/handlers/wotd.ts) that:
  *
  *  1. no-ops if `WOTD_CHANNEL_ID` is unset (safe until a post channel is chosen)
  *  2. no-ops if today (JST) already has a `posted=1` row in `wotd_history`
@@ -32,6 +33,7 @@ import {
 	type GlossaryTable,
 	getGlossary,
 	searchGlossary,
+	type WaitUntilCtx,
 } from "../services/glossary.js";
 import { type MdbLexemeSearchRow, searchLexemes } from "../services/mdb.js";
 import { allScripts, SCRIPT_LABELS, SCRIPTS } from "../services/script.js";
@@ -507,130 +509,170 @@ async function upsertPosted(
 		.run();
 }
 
+export type WotdOutcome =
+	| { status: "posted"; token: string }
+	| { status: "already-posted"; date: string }
+	| { status: "skipped"; reason: string };
+
 /**
- * The cron handler itself. Any thrown error (upstream API down, Discord post
- * failed, …) is caught and logged — never rethrown — since there's no
- * interaction to reply to; the history row is only written after a confirmed
- * successful post, so a failed run always retries safely next time.
+ * The context slice the WOTD pipeline needs — satisfied by both `CronContext`
+ * (the daily trigger) and `CommandContext` (the `/wotd` manual trigger), which
+ * share discord-hono's `Context` base.
+ */
+export interface WotdContext {
+	env: Env;
+	executionCtx: WaitUntilCtx;
+	rest: CronContext<AppEnv>["rest"];
+}
+
+/**
+ * Runs the whole pick/enrich/post pipeline once and reports what happened.
+ * Upstream/Discord failures throw — the caller decides how to surface them.
+ * The history row is only written after a confirmed-successful post, so a
+ * failed run always retries safely next time.
  *
  * `now` defaults to the real clock; tests inject a fixed `Date` so the JST
  * date (and therefore the deterministic hash pick) is reproducible.
  */
-export async function runWotd(
-	c: CronContext<AppEnv>,
+export async function postWotd(
+	c: WotdContext,
 	now: Date = new Date(),
-): Promise<void> {
+): Promise<WotdOutcome> {
 	const channelId = c.env.WOTD_CHANNEL_ID;
 	if (!channelId) {
-		console.warn("[wotd] WOTD_CHANNEL_ID is empty — skipping (safe no-op)");
-		return;
+		return { status: "skipped", reason: "WOTD_CHANNEL_ID is empty" };
 	}
 
 	const db = c.env.DB;
 	const today = jstDateString(now);
 
-	try {
-		if (await alreadyPostedToday(db, today)) {
-			console.log(`[wotd] ${today} already posted — no-op`);
-			return;
-		}
+	if (await alreadyPostedToday(db, today)) {
+		return { status: "already-posted", date: today };
+	}
 
-		const rows = await freqList(c.env, {
-			limit: CANDIDATE_LIMIT,
-			includeStopwords: false,
-			minCount: CANDIDATE_MIN_COUNT,
+	const rows = await freqList(c.env, {
+		limit: CANDIDATE_LIMIT,
+		includeStopwords: false,
+		minCount: CANDIDATE_MIN_COUNT,
+	});
+	const excluded = await recentTokens(
+		db,
+		shiftDateString(today, -RECENT_WINDOW_DAYS),
+	);
+	const candidates = filterCandidates(rows, excluded);
+	if (candidates.length === 0) {
+		return {
+			status: "skipped",
+			reason: "no eligible candidates after filtering",
+		};
+	}
+
+	const table = await getGlossary(c.env, c.executionCtx);
+	const startIndex = pickIndex(today, candidates.length);
+	let selected: WotdSelection | undefined;
+	// First glossary-backed candidate whose MDB lexemes were ambiguous —
+	// used as a fallback (glossary gloss only) so an all-ambiguous day still
+	// posts instead of being silently skipped.
+	let ambiguousFallback: WotdSelection | undefined;
+	const probes = Math.min(MAX_PROBE, candidates.length);
+	for (let step = 0; step < probes; step++) {
+		const index = (startIndex + step) % candidates.length;
+		// biome-ignore lint/style/noNonNullAssertion: index is derived from candidates.length > 0.
+		const token = candidates[index]!;
+		const entry = glossaryExactEntry(table, token);
+		if (!entry) continue;
+
+		const exampleRows = await searchCorpus(c.env, {
+			q: token,
+			lang: "ain",
+			limit: EXAMPLE_FETCH_LIMIT,
 		});
-		const excluded = await recentTokens(
-			db,
-			shiftDateString(today, -RECENT_WINDOW_DAYS),
+		const examples = selectExamples(exampleRows, token);
+		const lexemeRows = await searchLexemes(
+			c.env,
+			token,
+			MDB_LEXEME_LOOKUP_LIMIT,
 		);
-		const candidates = filterCandidates(rows, excluded);
-		if (candidates.length === 0) {
-			console.error("[wotd] no eligible candidates after filtering — skipping");
-			return;
+		const { lexeme, ambiguous } = selectWotdLexeme(
+			token,
+			lexemeRows.results,
+			examples,
+		);
+		if (ambiguous) {
+			console.warn(`[wotd] ${token} has ambiguous MDB lexemes — probing next`);
+			if (!ambiguousFallback) {
+				// Remember the first ambiguous candidate: glossary gloss only.
+				ambiguousFallback = { token, entry, examples, lexeme: undefined };
+			}
+			continue;
 		}
-
-		const table = await getGlossary(c.env, c.executionCtx);
-		const startIndex = pickIndex(today, candidates.length);
-		let selected: WotdSelection | undefined;
-		// First glossary-backed candidate whose MDB lexemes were ambiguous —
-		// used as a fallback (glossary gloss only) so an all-ambiguous day still
-		// posts instead of being silently skipped.
-		let ambiguousFallback: WotdSelection | undefined;
-		const probes = Math.min(MAX_PROBE, candidates.length);
-		for (let step = 0; step < probes; step++) {
-			const index = (startIndex + step) % candidates.length;
-			// biome-ignore lint/style/noNonNullAssertion: index is derived from candidates.length > 0.
-			const token = candidates[index]!;
-			const entry = glossaryExactEntry(table, token);
-			if (!entry) continue;
-
-			const exampleRows = await searchCorpus(c.env, {
-				q: token,
-				lang: "ain",
-				limit: EXAMPLE_FETCH_LIMIT,
-			});
-			const examples = selectExamples(exampleRows, token);
-			const lexemeRows = await searchLexemes(
-				c.env,
-				token,
-				MDB_LEXEME_LOOKUP_LIMIT,
-			);
-			const { lexeme, ambiguous } = selectWotdLexeme(
-				token,
-				lexemeRows.results,
+		selected = {
+			token,
+			entry,
+			examples: filterExamplesBySense(
 				examples,
-			);
-			if (ambiguous) {
-				console.warn(
-					`[wotd] ${token} has ambiguous MDB lexemes — probing next`,
-				);
-				if (!ambiguousFallback) {
-					// Remember the first ambiguous candidate: glossary gloss only.
-					ambiguousFallback = { token, entry, examples, lexeme: undefined };
-				}
-				continue;
-			}
-			selected = {
-				token,
-				entry,
-				examples: filterExamplesBySense(
-					examples,
-					lexeme,
-					lexemeRows.results,
-					token,
-				),
 				lexeme,
+				lexemeRows.results,
+				token,
+			),
+			lexeme,
+		};
+		break;
+	}
+	if (!selected) {
+		if (ambiguousFallback) {
+			console.warn(
+				`[wotd] ${ambiguousFallback.token}: MDB enrichment skipped due to homograph ambiguity — posting glossary gloss only`,
+			);
+			selected = ambiguousFallback;
+		} else {
+			return {
+				status: "skipped",
+				reason: "no glossary-backed candidate at all",
 			};
-			break;
 		}
-		if (!selected) {
-			if (ambiguousFallback) {
-				console.warn(
-					`[wotd] ${ambiguousFallback.token}: MDB enrichment skipped due to homograph ambiguity — posting glossary gloss only`,
-				);
-				selected = ambiguousFallback;
-			} else {
-				console.warn("[wotd] no glossary-backed candidate at all — skipping");
-				return;
-			}
-		}
+	}
 
-		const res = await c.rest("POST", $channels$_$messages, [channelId], {
-			embeds: [
-				wotdEmbed(
-					selected.token,
-					selected.entry,
-					selected.examples,
-					selected.lexeme,
-				).toJSON(),
-			],
-		});
-		if (!res.ok) {
-			throw new Error(`Discord post failed: HTTP ${res.status}`);
-		}
+	const res = await c.rest("POST", $channels$_$messages, [channelId], {
+		embeds: [
+			wotdEmbed(
+				selected.token,
+				selected.entry,
+				selected.examples,
+				selected.lexeme,
+			).toJSON(),
+		],
+	});
+	if (!res.ok) {
+		throw new Error(`Discord post failed: HTTP ${res.status}`);
+	}
 
-		await upsertPosted(db, today, selected.token);
+	await upsertPosted(db, today, selected.token);
+	return { status: "posted", token: selected.token };
+}
+
+/**
+ * The daily cron handler. Any thrown error (upstream API down, Discord post
+ * failed, …) is caught and logged — never rethrown — since there's no
+ * interaction to reply to.
+ */
+export async function runWotd(
+	c: CronContext<AppEnv>,
+	now: Date = new Date(),
+): Promise<void> {
+	try {
+		const outcome = await postWotd(c, now);
+		switch (outcome.status) {
+			case "posted":
+				console.log(`[wotd] posted ${outcome.token}`);
+				break;
+			case "already-posted":
+				console.log(`[wotd] ${outcome.date} already posted — no-op`);
+				break;
+			case "skipped":
+				console.warn(`[wotd] ${outcome.reason} — skipping`);
+				break;
+		}
 	} catch (err) {
 		console.error(
 			"[wotd] run failed — no history row written, will retry",
@@ -639,9 +681,11 @@ export async function runWotd(
 		// Surface the failure in the WOTD channel itself — an unnoticed missing
 		// post is worse than one error line. Best-effort: if Discord itself is
 		// what failed, this may fail too, and the console line above remains.
+		// A throw implies the channel check inside postWotd already passed, so
+		// WOTD_CHANNEL_ID is set here.
 		try {
 			const message = err instanceof Error ? err.message : String(err);
-			await c.rest("POST", $channels$_$messages, [channelId], {
+			await c.rest("POST", $channels$_$messages, [c.env.WOTD_CHANNEL_ID], {
 				content: `⚠️ 今日のアイヌ語の投稿に失敗しました。次回の実行で再試行します。 / Word-of-the-day failed and will retry on the next run.\n-# ${truncate(message, 200)}`,
 			});
 		} catch (reportErr) {
