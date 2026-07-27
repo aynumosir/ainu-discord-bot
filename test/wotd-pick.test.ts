@@ -265,6 +265,19 @@ describe("MDB lexeme selection for WOTD", () => {
 		]);
 	});
 
+	test("a variation surface matches the token key", () => {
+		const rows = [
+			lexeme({
+				id: "uenewsar.vi",
+				lemma: "uenewsar",
+				variations: [{ surface: "uwenewsar", dialects: [] }],
+			}),
+		];
+		expect(exactLexemeRows(rows, "uwenewsar").map((r) => r.id)).toEqual([
+			"uenewsar.vi",
+		]);
+	});
+
 	test("nina firewood example selects the firewood verb, not place/fish senses", () => {
 		const rows = [
 			lexeme({

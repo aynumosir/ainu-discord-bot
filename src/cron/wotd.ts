@@ -266,7 +266,7 @@ export function exactLexemeRows(
 ): MdbLexemeSearchRow[] {
 	const target = wotdKey(token);
 	return rows.filter((row) => {
-		const forms = [row.lemma, ...row.variations];
+		const forms = [row.lemma, ...row.variations.map((v) => v.surface)];
 		return forms.some((form) => wotdKey(form) === target);
 	});
 }

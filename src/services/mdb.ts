@@ -104,6 +104,12 @@ export interface MdbFormsResult {
 	results: MdbFormRow[];
 }
 
+/** A variant surface form of a lexeme, with the dialects it is attested in. */
+export interface MdbLexemeVariation {
+	surface: string;
+	dialects: string[];
+}
+
 /** One row of `/api/lexemes` (`rowView()` in mdb's lexeme API). */
 export interface MdbLexemeSearchRow {
 	id: string;
@@ -114,7 +120,7 @@ export interface MdbLexemeSearchRow {
 	gloss_jp: string[];
 	bound: boolean;
 	dialects: string[];
-	variations: string[];
+	variations: MdbLexemeVariation[];
 	recordings: number;
 	morphemes: string[];
 }
