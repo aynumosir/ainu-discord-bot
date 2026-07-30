@@ -485,22 +485,22 @@ export function selectWotdSense(
 	const pooled = commonRows.filter((row) =>
 		lexemeMatchesExampleContext(row, examples),
 	);
-	// biome-ignore lint/style/noNonNullAssertion: length checks below guarantee the index.
-	if (pooled.length === 1) return { kind: "resolved", lexeme: pooled[0]! };
 	if (pooled.length > 1) {
-		const byPrimary = pooled.filter((row) =>
-			lexemeMatchesExampleContext(row, examples.slice(0, 1)),
+		return resolvedOrAmbiguous(
+			pooled.filter((row) =>
+				lexemeMatchesExampleContext(row, examples.slice(0, 1)),
+			),
 		);
-		return byPrimary.length === 1
-			? // biome-ignore lint/style/noNonNullAssertion: length is checked on the line above.
-				{ kind: "resolved", lexeme: byPrimary[0]! }
-			: { kind: "unresolved", reason: "ambiguous" };
 	}
-	// biome-ignore lint/style/noNonNullAssertion: length is checked on this line.
-	if (commonRows.length === 1)
-		return { kind: "resolved", lexeme: commonRows[0]! };
+	return resolvedOrAmbiguous(pooled.length === 1 ? pooled : commonRows);
+}
 
-	return { kind: "unresolved", reason: "ambiguous" };
+/** Resolved on exactly one candidate sense, ambiguous on any other count. */
+function resolvedOrAmbiguous(rows: readonly MdbLexemeSearchRow[]): WotdSense {
+	const sole = rows.length === 1 ? rows[0] : undefined;
+	return sole
+		? { kind: "resolved", lexeme: sole }
+		: { kind: "unresolved", reason: "ambiguous" };
 }
 
 /**
