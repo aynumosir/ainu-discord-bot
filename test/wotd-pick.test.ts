@@ -5,13 +5,14 @@ import {
 	filterCandidates,
 	filterExamplesByMeaning,
 	filterExamplesBySense,
-	glossaryExactEntry,
+	glossaryExactEntries,
 	isCandidateToken,
 	jstDateString,
 	pickIndex,
 	probeForGlossaryHit,
 	rankGlosses,
 	selectExamples,
+	selectGlossaryEntry,
 	selectWotdSense,
 	shiftDateString,
 	wotdEmbed,
@@ -204,7 +205,7 @@ describe("probeForGlossaryHit", () => {
 	});
 });
 
-describe("glossaryExactEntry", () => {
+describe("glossaryExactEntries", () => {
 	const table: GlossaryEntry[] = [
 		{ Aynu: "sínep", 日本語: "一つ", English: "one", sheetName: "numbers" },
 		{ Aynu: "sinep tuye", 日本語: "一つ切る", sheetName: "numbers" },
@@ -212,19 +213,84 @@ describe("glossaryExactEntry", () => {
 	];
 
 	test("finds an exact (accent/case-insensitive) Aynu match", () => {
-		expect(glossaryExactEntry(table, "sinep")?.日本語).toBe("一つ");
-		expect(glossaryExactEntry(table, "SINEP")?.日本語).toBe("一つ");
+		expect(glossaryExactEntries(table, "sinep")[0]?.日本語).toBe("一つ");
+		expect(glossaryExactEntries(table, "SINEP")[0]?.日本語).toBe("一つ");
 	});
 
 	test("does not match a mere prefix/substring as 'exact'", () => {
 		// searchGlossary would surface "sinep tuye" as a *prefix* match for the
-		// query "sinep tuy" (missing the final "e") — glossaryExactEntry must
+		// query "sinep tuy" (missing the final "e") — glossaryExactEntries must
 		// still reject it, since the folded strings aren't equal.
-		expect(glossaryExactEntry(table, "sinep tuy")).toBeUndefined();
+		expect(glossaryExactEntries(table, "sinep tuy")).toEqual([]);
 	});
 
 	test("returns undefined when there is no glossary entry at all", () => {
-		expect(glossaryExactEntry(table, "nonexistentword")).toBeUndefined();
+		expect(glossaryExactEntries(table, "nonexistentword")).toEqual([]);
+	});
+
+	test("returns every row sharing the form, in table order", () => {
+		const senses: GlossaryEntry[] = [
+			{ Aynu: "ine", 日本語: "どら、どれどれ", sheetName: "interjection" },
+			{ Aynu: "ine", 日本語: "四", English: "four", sheetName: "number" },
+		];
+		expect(glossaryExactEntries(senses, "ine")).toEqual(senses);
+	});
+});
+
+describe("selectGlossaryEntry", () => {
+	const interjection: GlossaryEntry = {
+		Aynu: "ine",
+		日本語: "どら、どれどれ",
+		sheetName: "interjection",
+	};
+	const four: GlossaryEntry = {
+		Aynu: "ine",
+		日本語: "四",
+		English: "four",
+		sheetName: "number",
+	};
+	const numeral: MdbLexemeSearchRow = {
+		id: "ine.num",
+		lemma: "ine",
+		kana: "イネ",
+		pos: "num",
+		gloss_en: ["four"],
+		gloss_jp: ["四"],
+		bound: false,
+		dialects: [],
+		variations: [],
+		recordings: 0,
+		morphemes: [],
+	};
+	const counting: CorpusRow = {
+		id: "s1",
+		text: "ine p ne",
+		translation: "四つである",
+		dialect: "沙流",
+		author: null,
+		collection: null,
+		document: null,
+		uri: null,
+	};
+
+	test("a form with one row needs no choosing", () => {
+		expect(selectGlossaryEntry([four], undefined, [])).toBe(four);
+	});
+
+	test("the resolved MDB sense decides which row speaks", () => {
+		expect(selectGlossaryEntry([interjection, four], numeral, [])).toBe(four);
+	});
+
+	test("with no MDB sense, the row the examples show wins", () => {
+		expect(
+			selectGlossaryEntry([interjection, four], undefined, [counting]),
+		).toBe(four);
+	});
+
+	test("nothing corroborating leaves the first row, as before", () => {
+		expect(selectGlossaryEntry([interjection, four], undefined, [])).toBe(
+			interjection,
+		);
 	});
 });
 

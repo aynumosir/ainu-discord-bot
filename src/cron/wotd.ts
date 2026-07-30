@@ -39,7 +39,6 @@ import {
 	type GlossaryEntry,
 	type GlossaryTable,
 	getGlossary,
-	searchGlossary,
 	type WaitUntilCtx,
 } from "../services/glossary.js";
 import { type MdbLexemeSearchRow, searchLexemes } from "../services/mdb.js";
@@ -52,7 +51,6 @@ const MAX_PROBE = 20;
 const EXAMPLE_FETCH_LIMIT = 40;
 const EXAMPLE_MAX = 3;
 const EXAMPLE_FIELD_MAX = 1024;
-const GLOSSARY_LOOKUP_LIMIT = 5;
 // The lexeme search matches lemma, kana, variations and both gloss pools by
 // substring, ordered by recording count, so a short token is buried under the
 // longer words that contain it: `tap`'s own five senses sit at ranks 56–156 of
@@ -262,15 +260,53 @@ export function selectExamples(
 	return picked;
 }
 
-/** The glossary row whose `Aynu` field exactly matches `token` (accent/case-insensitive), if any. */
-export function glossaryExactEntry(
+/**
+ * Every glossary row whose `Aynu` field is exactly `token` (accent- and
+ * case-insensitively). The glossary splits senses into rows as MDB splits them
+ * into lexemes — `ine` is both どら and 四, `kunne` both 夜 and 黒 — so a form
+ * with more than one row is a sense to choose, not a duplicate to ignore.
+ */
+export function glossaryExactEntries(
 	table: GlossaryTable,
 	token: string,
-): GlossaryEntry | undefined {
+): GlossaryEntry[] {
 	const target = normalizeAynu(token);
-	return searchGlossary(table, token, GLOSSARY_LOOKUP_LIMIT).find(
+	return table.filter(
 		(entry) => entry.Aynu !== undefined && normalizeAynu(entry.Aynu) === target,
 	);
+}
+
+/**
+ * The row that speaks for the token, where several share its form: the one whose
+ * meaning the chosen MDB sense agrees with, else the one the most sentences show
+ * — `kunne` is both 夜 and 黒, and the sentences the corpus offers for a given
+ * day are what says which of the two the day is about. Falling back to the first
+ * row is the old behaviour, and the reason this exists: it made `ine` as likely
+ * to be headlined どら over four sentences counting to four as the other way
+ * round.
+ */
+export function selectGlossaryEntry(
+	entries: readonly GlossaryEntry[],
+	lexeme: MdbLexemeSearchRow | undefined,
+	examples: readonly CorpusRow[],
+): GlossaryEntry | undefined {
+	if (entries.length <= 1) return entries[0];
+	const glosses = lexeme ? [...lexeme.gloss_jp, ...lexeme.gloss_en] : [];
+	const agreeing = entries.find((entry) =>
+		entryMeanings(entry).some((meaning) =>
+			glosses.some((gloss) => meaningsAgree(meaning, gloss)),
+		),
+	);
+	if (agreeing) return agreeing;
+	// A tie keeps table order, since `sort` is stable and the counts are equal.
+	const [best] = entries
+		.map((entry) => ({
+			entry,
+			shown: filterExamplesByMeaning(examples, entryMeanings(entry)).length,
+		}))
+		.filter(({ shown }) => shown > 0)
+		.sort((a, b) => b.shown - a.shown);
+	return best?.entry ?? entries[0];
 }
 
 /**
@@ -970,8 +1006,8 @@ async function enrichToken(
 	table: GlossaryTable,
 	token: string,
 ): Promise<{ selection: WotdSelection; sense: WotdSense } | undefined> {
-	const entry = glossaryExactEntry(table, token);
-	if (!entry) return undefined;
+	const entries = glossaryExactEntries(table, token);
+	if (entries.length === 0) return undefined;
 
 	const exampleRows = await searchCorpus(c.env, {
 		q: token,
@@ -981,6 +1017,14 @@ async function enrichToken(
 	const examples = selectExamples(exampleRows, token);
 	const lookup = await searchLexemes(c.env, token, MDB_LEXEME_LOOKUP_LIMIT);
 	const sense = selectWotdSense(token, lookup, examples);
+	// The row is chosen after the sense, so the sense the examples support is what
+	// decides which of the form's rows the embed prints.
+	const entry = selectGlossaryEntry(
+		entries,
+		sense.kind === "resolved" ? sense.lexeme : undefined,
+		examples,
+	);
+	if (!entry) return undefined;
 	return {
 		selection: {
 			token,
