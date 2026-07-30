@@ -147,6 +147,27 @@ const GLOSSARY_TABLE = [
 	{ Aynu: "utar", 日本語: "人々", English: "people", sheetName: "core" },
 ];
 
+const corpusRow = (
+	id: string,
+	text: string,
+	translation: string,
+	document = "doc1",
+) => ({
+	id,
+	text,
+	translation,
+	dialect: "沙流",
+	author: null,
+	collection: null,
+	document,
+	uri: null,
+});
+
+const DEFAULT_CORPUS_ROWS = [
+	corpusRow("s1", "utar okay.", "people are there."),
+];
+
+let corpusRows: unknown[] = DEFAULT_CORPUS_ROWS;
 let discordPosts: unknown[] = [];
 let discordShouldFail = false;
 let mdbLexemeResults: unknown[] = [];
@@ -155,6 +176,7 @@ const originalFetch = globalThis.fetch;
 function stubFetch() {
 	discordPosts = [];
 	mdbLexemeResults = [];
+	corpusRows = DEFAULT_CORPUS_ROWS;
 	globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 		const url = String(input);
 		if (url.startsWith(`${CORPUS_URL}/v1/freq/list`)) {
@@ -164,21 +186,7 @@ function stubFetch() {
 		}
 		if (url.startsWith(`${CORPUS_URL}/v1/search`)) {
 			return new Response(
-				JSON.stringify({
-					api_version: "1",
-					data: [
-						{
-							id: "s1",
-							text: "utar okay.",
-							translation: "people are there.",
-							dialect: "沙流",
-							author: null,
-							collection: null,
-							document: "doc1",
-							uri: null,
-						},
-					],
-				}),
+				JSON.stringify({ api_version: "1", data: corpusRows }),
 			);
 		}
 		if (url.startsWith(`${MDB_URL}/api/lexemes`)) {
@@ -297,6 +305,35 @@ describe("runWotd", () => {
 		expect(db.rows.size).toBe(1);
 		expect([...db.rows.values()][0].posted).toBe(1);
 		expect([...db.rows.values()][0].token).toBe("utar");
+	});
+
+	test("an unresolved sense takes its examples from the whole corpus pool", async () => {
+		stubFetch();
+		// Short sentences from distinct sources lead the ranking, so a slate cut to
+		// three before the meaning is checked holds none of the sentences that show
+		// 人々 — the day would post with no example at all.
+		corpusRows = [
+			corpusRow("s1", "utar ne.", "そうである。", "doc1"),
+			corpusRow("s2", "utar an.", "そこにある。", "doc2"),
+			corpusRow("s3", "utar ka.", "それもだ。", "doc3"),
+			corpusRow("s4", "utar opitta arpa.", "人々はみな行った。", "doc4"),
+		];
+		const db = new FakeD1();
+		const { c, settle } = makeContext(makeEnv(db, new MemoryKV()));
+
+		await runWotd(c, NOW);
+		await settle();
+
+		const embed = (
+			discordPosts[0] as {
+				embeds: { fields: { name: string; value: string }[] }[];
+			}
+		).embeds[0];
+		const examples = embed.fields.find((f) =>
+			f.name.includes("Example"),
+		)?.value;
+		expect(examples).toContain("utar opitta arpa.");
+		expect(examples).not.toContain("utar ne.");
 	});
 
 	test("a re-fired cron trigger on the same JST day is a no-op (idempotent)", async () => {

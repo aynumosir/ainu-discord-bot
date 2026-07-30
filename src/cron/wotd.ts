@@ -534,10 +534,13 @@ export function filterExamplesBySense(
  * glossary row occurring in the sentence or its translation. This is the gate
  * for an unresolved sense, where `filterExamplesBySense` has no sense to name
  * rivals against: with nothing vouching for the pairing, only a sentence that
- * shows the meaning itself may stand under it. Where the row offers no CJK term
- * to look for, its English words are matched against the translation alone —
- * the Ainu text is Latin script too, and `nu` would "attest" any gloss
- * containing "nu".
+ * shows the meaning itself may stand under it.
+ *
+ * It runs over everything the corpus returned rather than over a slate already
+ * cut to three, so the diversity and length ranking of `selectExamples` chooses
+ * among corroborating sentences instead of being narrowed by them: gating the
+ * slate left `tane` one example of three and `katkemat` one, where gating the
+ * pool leaves both with three.
  *
  * Requiring the meaning to be visible is strict: 「水」 will not corroborate a
  * translation that says 湯, and that day's word goes to another candidate. It is
@@ -550,16 +553,26 @@ export function filterExamplesByMeaning(
 ): CorpusRow[] {
 	const usable = meanings.filter((meaning) => meaning.trim() !== "");
 	if (usable.length === 0) return [];
-	return examples.filter((ex) => {
-		const translation = ex.translation ?? "";
-		const whole = `${ex.text}\n${translation}`;
-		return usable.some((meaning) => {
-			if (textAttestsGloss(meaning, whole)) return true;
-			if (glossTerms(meaning).length > 0) return false;
-			const words = new Set(latinWords(translation));
-			return glossWords(meaning).some((word) => words.has(word));
-		});
-	});
+	return examples.filter((ex) =>
+		usable.some((meaning) => meaningOccursIn(meaning, ex)),
+	);
+}
+
+/** The meanings a glossary row states, in the two languages the embed prints. */
+function entryMeanings(entry: GlossaryEntry): string[] {
+	return [entry.日本語 ?? "", entry.English ?? ""];
+}
+
+/** Whether a sentence or its translation shows `meaning`. */
+function meaningOccursIn(meaning: string, ex: CorpusRow): boolean {
+	const translation = ex.translation ?? "";
+	if (textAttestsGloss(meaning, `${ex.text}\n${translation}`)) return true;
+	// Where the meaning offers no CJK term to look for, its English words are
+	// matched against the translation alone — the Ainu text is Latin script too,
+	// and `nu` would "attest" any gloss containing "nu".
+	if (glossTerms(meaning).length > 0) return false;
+	const words = new Set(latinWords(translation));
+	return glossWords(meaning).some((word) => words.has(word));
 }
 
 function scriptsFieldValue(token: string): string {
@@ -975,10 +988,13 @@ async function enrichToken(
 			examples:
 				sense.kind === "resolved"
 					? filterExamplesBySense(examples, sense.lexeme, lookup.results, token)
-					: filterExamplesByMeaning(examples, [
-							entry.日本語 ?? "",
-							entry.English ?? "",
-						]),
+					: // The corroborating sentences are chosen from everything the corpus
+						// returned, so `selectExamples` still ranks by source and length
+						// among them; `examples` above only had to decide the sense.
+						selectExamples(
+							filterExamplesByMeaning(exampleRows, entryMeanings(entry)),
+							token,
+						),
 			lexeme: sense.kind === "resolved" ? sense.lexeme : undefined,
 		},
 		sense,
