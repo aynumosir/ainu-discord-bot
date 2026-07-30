@@ -17,7 +17,11 @@
  *  3. sources candidates from `/v1/freq/list`, filters them, deterministically
  *     picks one by `fnv1a(date)`, probing forward for a glossary hit
  *  4. enriches with a glossary gloss, up to 3 whole-word corpus examples from
- *     distinct sources, and all 3 supported scripts
+ *     distinct sources, and all 3 supported scripts. A meaning and the sentences
+ *     under it must belong to the same sense: the examples pick the MDB lexeme
+ *     whose glosses they attest, and where they cannot pick one, only a sentence
+ *     that shows the glossary meaning itself is kept. A candidate left with no
+ *     sentence yields the day to one that reads whole.
  *  5. posts an embed via the cron context's REST helper, then upserts the
  *     history row — only on a confirmed-successful post, so a failure never
  *     leaves a false "posted" row behind (the next day's run would still
@@ -49,7 +53,14 @@ const EXAMPLE_FETCH_LIMIT = 40;
 const EXAMPLE_MAX = 3;
 const EXAMPLE_FIELD_MAX = 1024;
 const GLOSSARY_LOOKUP_LIMIT = 5;
-const MDB_LEXEME_LOOKUP_LIMIT = 20;
+// The lexeme search matches lemma, kana, variations and both gloss pools by
+// substring, ordered by recording count, so a short token is buried under the
+// longer words that contain it: `tap`'s own five senses sit at ranks 56–156 of
+// 199 hits, and a 20-row window saw none of them — the homograph machinery
+// below then ran on an empty candidate set and reported no ambiguity at all.
+// 200 is the API's per-request ceiling; a window that is still truncated means
+// the senses are unknown, not absent (see `selectWotdSense`).
+const MDB_LEXEME_LOOKUP_LIMIT = 200;
 // Past this a Japanese gloss is an explanation, not a label: 神 stays, but
 // 神のように立派な belongs in the note.
 const LABEL_MAX_CHARS = 5;
@@ -262,10 +273,22 @@ export function glossaryExactEntry(
 	);
 }
 
-export interface WotdLexemeSelection {
-	lexeme: MdbLexemeSearchRow | undefined;
-	ambiguous: boolean;
-}
+/**
+ * Which sense of the day's token the post may speak for. `resolved` carries the
+ * one MDB lexeme the examples support, so its glosses can headline the embed and
+ * rival senses can be filtered out of the slate. Everything else is
+ * `unresolved`: `ambiguous` — several senses, none of which the examples pick
+ * out; `truncated` — the lexeme window was cut short, so senses may exist that
+ * were never seen; `absent` — MDB carries no such lexeme, leaving the glossary
+ * row's single sense unchecked against any other layer. An unresolved sense
+ * never headlines an MDB gloss, and its examples must corroborate the glossary
+ * row (`filterExamplesByMeaning`) — the state that has to stay distinct from
+ * `resolved`, since it was an unresolved `tap` read as resolved that put
+ * 「こう」 sentences under 今し方.
+ */
+export type WotdSense =
+	| { kind: "resolved"; lexeme: MdbLexemeSearchRow }
+	| { kind: "unresolved"; reason: "ambiguous" | "truncated" | "absent" };
 
 interface WotdSelection {
 	token: string;
@@ -315,6 +338,18 @@ const GLOSS_TERM_RUNS: readonly RegExp[] = [
 /** English words of 3+ letters — the Latin-script counterpart of `GLOSS_TERM_RUNS`. */
 const LATIN_WORD = /[A-Za-z]{3,}/g;
 
+// A parenthesised run tells the reader where or how a word is used —
+// 「(人や動物の)肩」 names the possessor of a shoulder, 「(強めの助詞)」 a part of
+// speech, "(formerly made of wood)" a material. Its characters describe the
+// entry, so they are no evidence that a sentence uses the sense: the 人 of
+// 「(人や動物の)肩」 matched 「親戚の人たちに子が多くても」 and headlined tap as 肩.
+const PARENTHETICAL = /[(（][^()（）]*[)）]/g;
+
+/** A gloss with its parenthesised asides removed, for matching against a text. */
+function glossCore(gloss: string): string {
+	return gloss.replace(PARENTHETICAL, " ");
+}
+
 /**
  * The meaning-bearing substrings of a gloss. A single Han character carries
  * meaning (corpus translations often say just 薪); hiragana needs >= 3 chars —
@@ -329,7 +364,7 @@ function glossTerms(gloss: string): string[] {
 			: re.source.includes("Hiragana")
 				? 3
 				: 2;
-		for (const term of gloss.match(re) ?? []) {
+		for (const term of glossCore(gloss).match(re) ?? []) {
 			if (term.length >= min) terms.push(term);
 		}
 	}
@@ -340,13 +375,18 @@ function latinWords(text: string): string[] {
 	return text.toLowerCase().match(LATIN_WORD) ?? [];
 }
 
+/** `latinWords` of a gloss — its asides excluded, as in `glossTerms`. */
+function glossWords(gloss: string): string[] {
+	return latinWords(glossCore(gloss));
+}
+
 function textAttestsGloss(gloss: string, text: string): boolean {
 	return glossTerms(gloss).some((term) => text.includes(term));
 }
 
 /** Whether a gloss offers anything that can be checked against another text. */
 function hasCheckableTerm(gloss: string): boolean {
-	return glossTerms(gloss).length > 0 || latinWords(gloss).length > 0;
+	return glossTerms(gloss).length > 0 || glossWords(gloss).length > 0;
 }
 
 /**
@@ -356,8 +396,8 @@ function hasCheckableTerm(gloss: string): boolean {
 function meaningsAgree(a: string, b: string): boolean {
 	if (a.trim() === "" || b.trim() === "") return false;
 	if (textAttestsGloss(a, b) || textAttestsGloss(b, a)) return true;
-	const words = new Set(latinWords(b));
-	return latinWords(a).some((word) => words.has(word));
+	const words = new Set(glossWords(b));
+	return glossWords(a).some((word) => words.has(word));
 }
 
 const CJK_CHAR = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
@@ -400,16 +440,26 @@ function lexemeMatchesExampleContext(
 }
 
 /**
- * Pick one MDB lexeme for the WOTD token. Ambiguous bare homographs are skipped
- * unless the example/query context can safely choose a non-proper-name sense.
+ * The one MDB sense the day's examples support, or why none could be had. A
+ * bare homograph the examples cannot tell apart stays unresolved, and so does
+ * every token whose lookup window was cut short: `lookup.total` counting more
+ * rows than came back means a sense may sit outside the window, and a sense
+ * that was never seen can neither be chosen nor filtered against. Only a window
+ * that held every matching row can resolve one. Truncation is rare at the
+ * search API's 200-row ceiling — 3 of 40 sampled candidates, all of them two-
+ * or three-letter tokens contained in a thousand longer words.
  */
-export function selectWotdLexeme(
+export function selectWotdSense(
 	token: string,
-	rows: readonly MdbLexemeSearchRow[],
+	lookup: { results: readonly MdbLexemeSearchRow[]; total: number },
 	examples: readonly CorpusRow[],
-): WotdLexemeSelection {
+): WotdSense {
+	const rows = lookup.results;
+	if (lookup.total > rows.length) {
+		return { kind: "unresolved", reason: "truncated" };
+	}
 	const exact = exactLexemeRows(rows, token).filter((row) => !row.bound);
-	if (exact.length === 0) return { lexeme: undefined, ambiguous: false };
+	if (exact.length === 0) return { kind: "unresolved", reason: "absent" };
 
 	// Corpus frequency tokens are lowercase common words in practice. Do not let
 	// a proper-name row (e.g. Nina 荷菜) satisfy a lowercase WOTD unless the token
@@ -423,8 +473,8 @@ export function selectWotdLexeme(
 				examples.some((ex) => tokenAppearsInExample(ex, row.lemma)),
 		);
 		return proper
-			? { lexeme: proper, ambiguous: false }
-			: { lexeme: undefined, ambiguous: true };
+			? { kind: "resolved", lexeme: proper }
+			: { kind: "unresolved", reason: "ambiguous" };
 	}
 
 	// Pool all examples first — a sense picked here must be attested somewhere
@@ -435,23 +485,22 @@ export function selectWotdLexeme(
 	const pooled = commonRows.filter((row) =>
 		lexemeMatchesExampleContext(row, examples),
 	);
-	if (pooled.length === 1) {
-		return { lexeme: pooled[0], ambiguous: false };
-	}
+	// biome-ignore lint/style/noNonNullAssertion: length checks below guarantee the index.
+	if (pooled.length === 1) return { kind: "resolved", lexeme: pooled[0]! };
 	if (pooled.length > 1) {
 		const byPrimary = pooled.filter((row) =>
 			lexemeMatchesExampleContext(row, examples.slice(0, 1)),
 		);
-		if (byPrimary.length === 1) {
-			return { lexeme: byPrimary[0], ambiguous: false };
-		}
-		return { lexeme: undefined, ambiguous: true };
+		return byPrimary.length === 1
+			? // biome-ignore lint/style/noNonNullAssertion: length is checked on the line above.
+				{ kind: "resolved", lexeme: byPrimary[0]! }
+			: { kind: "unresolved", reason: "ambiguous" };
 	}
-	if (commonRows.length === 1) {
-		return { lexeme: commonRows[0], ambiguous: false };
-	}
+	// biome-ignore lint/style/noNonNullAssertion: length is checked on this line.
+	if (commonRows.length === 1)
+		return { kind: "resolved", lexeme: commonRows[0]! };
 
-	return { lexeme: undefined, ambiguous: true };
+	return { kind: "unresolved", reason: "ambiguous" };
 }
 
 /**
@@ -461,12 +510,11 @@ export function selectWotdLexeme(
  */
 export function filterExamplesBySense(
 	examples: readonly CorpusRow[],
-	lexeme: MdbLexemeSearchRow | undefined,
+	lexeme: MdbLexemeSearchRow,
 	rows: readonly MdbLexemeSearchRow[],
 	token: string,
 ): CorpusRow[] {
-	if (!lexeme) return [...examples];
-	// Mirror selectWotdLexeme's candidate rules: proper-name homographs are
+	// Mirror selectWotdSense's candidate rules: proper-name homographs are
 	// excluded there, so they must not act as rivals here either.
 	const rivals = exactLexemeRows(rows, token).filter(
 		(row) => !row.bound && row.id !== lexeme.id && !isProperNameLexeme(row),
@@ -479,6 +527,39 @@ export function filterExamplesBySense(
 			lexemeMatchesExampleContext(lexeme, [ex]) ||
 			!rivals.some((rival) => lexemeMatchesExampleContext(rival, [ex])),
 	);
+}
+
+/**
+ * The examples that corroborate the meaning the post will print — a term of the
+ * glossary row occurring in the sentence or its translation. This is the gate
+ * for an unresolved sense, where `filterExamplesBySense` has no sense to name
+ * rivals against: with nothing vouching for the pairing, only a sentence that
+ * shows the meaning itself may stand under it. Where the row offers no CJK term
+ * to look for, its English words are matched against the translation alone —
+ * the Ainu text is Latin script too, and `nu` would "attest" any gloss
+ * containing "nu".
+ *
+ * Requiring the meaning to be visible is strict: 「水」 will not corroborate a
+ * translation that says 湯, and that day's word goes to another candidate. It is
+ * the one rule that would have caught `tap`, whose 今し方 was corroborated by
+ * none of the three 「こう」/「このように」 sentences shown under it.
+ */
+export function filterExamplesByMeaning(
+	examples: readonly CorpusRow[],
+	meanings: readonly string[],
+): CorpusRow[] {
+	const usable = meanings.filter((meaning) => meaning.trim() !== "");
+	if (usable.length === 0) return [];
+	return examples.filter((ex) => {
+		const translation = ex.translation ?? "";
+		const whole = `${ex.text}\n${translation}`;
+		return usable.some((meaning) => {
+			if (textAttestsGloss(meaning, whole)) return true;
+			if (glossTerms(meaning).length > 0) return false;
+			const words = new Set(latinWords(translation));
+			return glossWords(meaning).some((word) => words.has(word));
+		});
+	});
 }
 
 function scriptsFieldValue(token: string): string {
@@ -866,15 +947,16 @@ export interface WotdContext {
 
 /**
  * Everything the embed needs for one token — corpus examples, the MDB sense the
- * examples support, the glossary row. `undefined` when the glossary has no row
- * for the token; `ambiguous` when the token's MDB homographs could not be told
- * apart, in which case the selection carries no lexeme.
+ * examples support, the glossary row — or `undefined` when the glossary has no
+ * row for the token. A resolved sense headlines its MDB glosses and keeps every
+ * example a rival sense does not claim; an unresolved one prints the glossary
+ * row alone and keeps only the examples that corroborate it, which may be none.
  */
 async function enrichToken(
 	c: WotdContext,
 	table: GlossaryTable,
 	token: string,
-): Promise<{ selection: WotdSelection; ambiguous: boolean } | undefined> {
+): Promise<{ selection: WotdSelection; sense: WotdSense } | undefined> {
 	const entry = glossaryExactEntry(table, token);
 	if (!entry) return undefined;
 
@@ -884,22 +966,22 @@ async function enrichToken(
 		limit: EXAMPLE_FETCH_LIMIT,
 	});
 	const examples = selectExamples(exampleRows, token);
-	const lexemeRows = await searchLexemes(c.env, token, MDB_LEXEME_LOOKUP_LIMIT);
-	const { lexeme, ambiguous } = selectWotdLexeme(
-		token,
-		lexemeRows.results,
-		examples,
-	);
+	const lookup = await searchLexemes(c.env, token, MDB_LEXEME_LOOKUP_LIMIT);
+	const sense = selectWotdSense(token, lookup, examples);
 	return {
 		selection: {
 			token,
 			entry,
-			examples: ambiguous
-				? examples
-				: filterExamplesBySense(examples, lexeme, lexemeRows.results, token),
-			lexeme: ambiguous ? undefined : lexeme,
+			examples:
+				sense.kind === "resolved"
+					? filterExamplesBySense(examples, sense.lexeme, lookup.results, token)
+					: filterExamplesByMeaning(examples, [
+							entry.日本語 ?? "",
+							entry.English ?? "",
+						]),
+			lexeme: sense.kind === "resolved" ? sense.lexeme : undefined,
 		},
-		ambiguous,
+		sense,
 	};
 }
 
@@ -996,10 +1078,13 @@ export async function postWotd(
 	const table = await getGlossary(c.env, c.executionCtx);
 	const startIndex = pickIndex(date, candidates.length);
 	let selected: WotdSelection | undefined;
-	// First glossary-backed candidate whose MDB lexemes were ambiguous —
-	// used as a fallback (glossary gloss only) so an all-ambiguous day still
-	// posts instead of being silently skipped.
-	let ambiguousFallback: WotdSelection | undefined;
+	// A candidate whose meaning survives with no sentence to show it still makes a
+	// post, so it is kept in reserve while the probe looks for one that reads
+	// whole: an MDB sense first, then any candidate at all. Preferring an example
+	// is what keeps the meaning-corroboration gate from thinning the posts —
+	// a word the gate strips bare yields the day to one it does not.
+	let senseWithoutExample: WotdSelection | undefined;
+	let lastResort: WotdSelection | undefined;
 	const probes = Math.min(MAX_PROBE, candidates.length);
 	for (let step = 0; step < probes; step++) {
 		const index = (startIndex + step) % candidates.length;
@@ -1007,27 +1092,28 @@ export async function postWotd(
 		const token = candidates[index]!;
 		const enriched = await enrichToken(c, table, token);
 		if (!enriched) continue;
-		if (enriched.ambiguous) {
-			console.warn(`[wotd] ${token} has ambiguous MDB lexemes — probing next`);
-			// Remember the first ambiguous candidate: glossary gloss only.
-			ambiguousFallback ??= enriched.selection;
+		const { selection, sense } = enriched;
+		if (selection.examples.length > 0) {
+			selected = selection;
+			break;
+		}
+		if (sense.kind === "resolved") {
+			senseWithoutExample ??= selection;
 			continue;
 		}
-		selected = enriched.selection;
-		break;
+		console.warn(
+			`[wotd] ${token}: sense unresolved (${sense.reason}) and no example corroborates its glossary meaning — probing next`,
+		);
+		lastResort ??= selection;
 	}
+	selected ??= senseWithoutExample ?? lastResort;
 	if (!selected) {
-		if (ambiguousFallback) {
-			console.warn(
-				`[wotd] ${ambiguousFallback.token}: MDB enrichment skipped due to homograph ambiguity — posting glossary gloss only`,
-			);
-			selected = ambiguousFallback;
-		} else {
-			return {
-				status: "skipped",
-				reason: "no glossary-backed candidate at all",
-			};
-		}
+		return { status: "skipped", reason: "no glossary-backed candidate at all" };
+	}
+	if (selected.examples.length === 0) {
+		console.warn(
+			`[wotd] ${selected.token}: posting without an example — no sentence stands under its meaning`,
+		);
 	}
 
 	await publish(c, channelId, selected, pastDate);

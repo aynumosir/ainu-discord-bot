@@ -3,6 +3,7 @@ import {
 	exactLexemeRows,
 	exampleFieldValue,
 	filterCandidates,
+	filterExamplesByMeaning,
 	filterExamplesBySense,
 	glossaryExactEntry,
 	isCandidateToken,
@@ -11,7 +12,7 @@ import {
 	probeForGlossaryHit,
 	rankGlosses,
 	selectExamples,
-	selectWotdLexeme,
+	selectWotdSense,
 	shiftDateString,
 	wotdEmbed,
 } from "../src/cron/wotd.js";
@@ -227,6 +228,12 @@ describe("glossaryExactEntry", () => {
 	});
 });
 
+/** A lexeme search whose window held every matching row. */
+const wholeLookup = (rows: readonly MdbLexemeSearchRow[]) => ({
+	results: rows,
+	total: rows.length,
+});
+
 describe("MDB lexeme selection for WOTD", () => {
 	const lexeme = (
 		partial: Partial<MdbLexemeSearchRow> &
@@ -308,11 +315,10 @@ describe("MDB lexeme selection for WOTD", () => {
 				gloss_jp: ["荷菜"],
 			}),
 		];
-		const selected = selectWotdLexeme("nina", rows, [
+		const sense = selectWotdSense("nina", wholeLookup(rows), [
 			example("semas nina poka suke poka", "粗末な薪でも料理でも"),
 		]);
-		expect(selected.ambiguous).toBe(false);
-		expect(selected.lexeme?.id).toBe("nina.vi");
+		expect(sense).toEqual({ kind: "resolved", lexeme: rows[0] });
 	});
 
 	test("nina mash-context example selects the mash verb (hiragana gloss こねつぶす)", () => {
@@ -337,11 +343,10 @@ describe("MDB lexeme selection for WOTD", () => {
 				gloss_jp: ["荷菜"],
 			}),
 		];
-		const selected = selectWotdLexeme("nina", rows, [
+		const sense = selectWotdSense("nina", wholeLookup(rows), [
 			example("kem nina", "筋子をこねつぶす"),
 		]);
-		expect(selected.ambiguous).toBe(false);
-		expect(selected.lexeme?.id).toBe("nina.vt");
+		expect(sense).toEqual({ kind: "resolved", lexeme: rows[1] });
 	});
 
 	test("lemma with a caseless first char (apostrophe) is NOT a proper name", () => {
@@ -355,17 +360,16 @@ describe("MDB lexeme selection for WOTD", () => {
 				gloss_jp: ["話す"],
 			}),
 		];
-		const selected = selectWotdLexeme("’itak", rows, [
+		const sense = selectWotdSense("’itak", wholeLookup(rows), [
 			example("’itak", "話す"),
 		]);
-		expect(selected.ambiguous).toBe(false);
-		expect(selected.lexeme?.id).toBe("itak.vi");
+		expect(sense).toEqual({ kind: "resolved", lexeme: rows[0] });
 	});
 
 	test("ambiguous bare homograph is skipped when context cannot choose a sense", () => {
-		const selected = selectWotdLexeme(
+		const sense = selectWotdSense(
 			"nina",
-			[
+			wholeLookup([
 				lexeme({
 					id: "nina.vi",
 					lemma: "nina¹",
@@ -373,10 +377,117 @@ describe("MDB lexeme selection for WOTD", () => {
 					gloss_jp: ["薪を採る"],
 				}),
 				lexeme({ id: "nina.n", lemma: "nina", pos: "n", gloss_jp: ["ヒラメ"] }),
-			],
+			]),
 			[example("nina ne.", "それである。")],
 		);
-		expect(selected).toEqual({ lexeme: undefined, ambiguous: true });
+		expect(sense).toEqual({ kind: "unresolved", reason: "ambiguous" });
+	});
+
+	test("no exact row in a whole window means MDB does not carry the token", () => {
+		const sense = selectWotdSense(
+			"tap",
+			wholeLookup([lexeme({ id: "tapan.adn", lemma: "tapan" })]),
+			[example("tap ne na.", "こうなんだよ。")],
+		);
+		expect(sense).toEqual({ kind: "unresolved", reason: "absent" });
+	});
+
+	// `tap` sits at ranks 56–156 of the 199 rows matching the substring, so the
+	// senses that decide the day's meaning were never in the window at all.
+	test("no exact row in a truncated window means the senses are unknown", () => {
+		const sense = selectWotdSense(
+			"tap",
+			{ results: [lexeme({ id: "tapan.adn", lemma: "tapan" })], total: 199 },
+			[example("tap ne na.", "こうなんだよ。")],
+		);
+		expect(sense).toEqual({ kind: "unresolved", reason: "truncated" });
+	});
+
+	test("a truncated window cannot resolve even the exact row it did return", () => {
+		const sense = selectWotdSense(
+			"ku",
+			{
+				results: [lexeme({ id: "ku.n", lemma: "ku", gloss_jp: ["弓"] })],
+				total: 1541,
+			},
+			[example("ku ani", "弓で")],
+		);
+		expect(sense).toEqual({ kind: "unresolved", reason: "truncated" });
+	});
+
+	test("a parenthesised aside is no evidence that a sense is attested", () => {
+		// tap.n glosses 「(人や動物の)肩」; the 人 of that aside matched
+		// 「親戚の人たちに子が多くても」 and headlined the day's word as 肩.
+		const rows = [
+			lexeme({
+				id: "tap.n",
+				lemma: "tap",
+				gloss_jp: ["(人や動物の)肩", "これ"],
+			}),
+			lexeme({
+				id: "tap.adv",
+				lemma: "tap",
+				pos: "adv",
+				gloss_jp: ["いましがた､ たった今"],
+			}),
+		];
+		const sense = selectWotdSense("tap", wholeLookup(rows), [
+			example(
+				"irwak utari tap irwak utari pókoinne pa yakka,",
+				"親戚の人たちに子が多くても、",
+			),
+		]);
+		expect(sense).toEqual({ kind: "unresolved", reason: "ambiguous" });
+	});
+});
+
+describe("filterExamplesByMeaning", () => {
+	const example = (text: string, translation: string): CorpusRow => ({
+		id: text,
+		text,
+		translation,
+		dialect: "沙流",
+		author: null,
+		collection: null,
+		document: null,
+		uri: null,
+	});
+
+	// The three sentences posted under tap 今し方 all used the 「こう」 sense.
+	test("drops sentences that do not show the glossary meaning", () => {
+		const examples = [
+			example("aoká ka tap nispa eepakki a=ne wa,", "私たちもこのように"),
+			example("néno an pe tap ne na.", "そういうものがこうなんだよ"),
+		];
+		expect(
+			filterExamplesByMeaning(examples, ["今し方、たった今", "right now"]),
+		).toEqual([]);
+	});
+
+	test("keeps a sentence whose translation carries a term of the meaning", () => {
+		const kept = example("tanto tap ek.", "今日たった今来た。");
+		expect(
+			filterExamplesByMeaning(
+				[kept, example("tap ne na.", "こうなんだよ。")],
+				["今し方、たった今", "right now"],
+			),
+		).toEqual([kept]);
+	});
+
+	test("matches an English-only meaning against the translation, not the Ainu text", () => {
+		// "nukar" would otherwise attest a gloss reading "to nurture".
+		const meanings = ["", "a whetstone"];
+		const ainuOnly = example("nukar wa", "見た");
+		const attested = example("tap nukar", "looked at the whetstone");
+		expect(filterExamplesByMeaning([ainuOnly, attested], meanings)).toEqual([
+			attested,
+		]);
+	});
+
+	test("a meaning with nothing to check keeps no example", () => {
+		expect(
+			filterExamplesByMeaning([example("tap ne", "こうだ")], ["", "  "]),
+		).toEqual([]);
 	});
 });
 
@@ -632,11 +743,8 @@ describe("filterExamplesBySense", () => {
 		).toEqual([]);
 	});
 
-	test("is a no-op without a selected lexeme or without rivals", () => {
+	test("is a no-op for a sense with no rivals", () => {
 		const examples = [ex("kem nina", "筋子をこねつぶす")];
-		expect(
-			filterExamplesBySense(examples, undefined, [firewood, mash], "nina"),
-		).toEqual(examples);
 		expect(
 			filterExamplesBySense(examples, firewood, [firewood], "nina"),
 		).toEqual(examples);
@@ -717,9 +825,8 @@ describe("review follow-up regressions", () => {
 			row({ text: "kem nina", translation: "筋子をこねつぶす" }),
 			row({ text: "semas nina poka", translation: "粗末な薪でも" }),
 		];
-		const selected = selectWotdLexeme("nina", [fire, mash], examples);
-		expect(selected.ambiguous).toBe(false);
-		expect(selected.lexeme?.id).toBe("nina.vt");
+		const sense = selectWotdSense("nina", wholeLookup([fire, mash]), examples);
+		expect(sense).toEqual({ kind: "resolved", lexeme: mash });
 	});
 
 	test("a sense matching no example at all cannot win against a pool-attested one", () => {
@@ -738,18 +845,16 @@ describe("review follow-up regressions", () => {
 			row({ text: "nina ne", translation: "それだ" }),
 			row({ text: "nina kusu paye", translation: "薪を採りに行った" }),
 		];
-		const selected = selectWotdLexeme("nina", [fire, flat], examples);
-		expect(selected.ambiguous).toBe(false);
-		expect(selected.lexeme?.id).toBe("nina.vi");
+		const sense = selectWotdSense("nina", wholeLookup([fire, flat]), examples);
+		expect(sense).toEqual({ kind: "resolved", lexeme: fire });
 	});
 
 	test("a 2-char hiragana gloss run (する) no longer matches every translation", () => {
 		const doer = lex({ id: "a", lemma: "kar¹", gloss_jp: ["～する"] });
 		const maker = lex({ id: "b", lemma: "kar²", gloss_jp: ["～を作る"] });
 		const examples = [row({ text: "cise kar", translation: "家を作る" })];
-		const selected = selectWotdLexeme("kar", [doer, maker], examples);
-		expect(selected.ambiguous).toBe(false);
-		expect(selected.lexeme?.id).toBe("b");
+		const sense = selectWotdSense("kar", wholeLookup([doer, maker]), examples);
+		expect(sense).toEqual({ kind: "resolved", lexeme: maker });
 	});
 
 	test("a proper-name homograph is not a rival in filterExamplesBySense", () => {
