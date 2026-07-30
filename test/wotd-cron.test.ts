@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { CronContext } from "discord-hono";
 import { createRest } from "discord-hono";
-import { runWotd } from "../src/cron/wotd.js";
+import { postWotd, runWotd } from "../src/cron/wotd.js";
 import type { AppEnv } from "../src/lib/errors.js";
 
 const CORPUS_URL = "https://corpus.aynu.org";
@@ -9,6 +9,8 @@ const MDB_URL = "https://mdb.aynu.org";
 const GLOSSARY_URL = "https://itak.aynu.org/api/gdoc";
 const CHANNEL_ID = "channel-123";
 const NOW = new Date("2026-07-03T10:00:00Z"); // 2026-07-03 JST
+const TODAY = "2026-07-03";
+const YESTERDAY = "2026-07-02";
 
 // --- Minimal in-memory D1 stub, mirroring the wotd_history schema. --------
 
@@ -40,6 +42,11 @@ class FakeStatement {
 			const [date] = this.#args as [string];
 			const row = this.#db.rows.get(date);
 			return (row ? { posted: row.posted } : null) as T | null;
+		}
+		if (this.#query.includes("SELECT token FROM wotd_history WHERE date = ?")) {
+			const [date] = this.#args as [string];
+			const row = this.#db.rows.get(date);
+			return (row ? { token: row.token } : null) as T | null;
 		}
 		throw new Error(`FakeStatement.first: unsupported query: ${this.#query}`);
 	}
@@ -292,7 +299,7 @@ describe("runWotd", () => {
 		expect([...db.rows.values()][0].token).toBe("utar");
 	});
 
-	test("rerun on the same JST day is a no-op (idempotent)", async () => {
+	test("a re-fired cron trigger on the same JST day is a no-op (idempotent)", async () => {
 		stubFetch();
 		const db = new FakeD1();
 		const kv = new MemoryKV();
@@ -309,6 +316,141 @@ describe("runWotd", () => {
 		// No additional Discord post on the second run.
 		expect(discordPosts).toHaveLength(1);
 		expect(db.rows.size).toBe(1);
+	});
+
+	test("a manual run on a recorded day reposts that word, never a fresh pick", async () => {
+		stubFetch();
+		const db = new FakeD1();
+		const kv = new MemoryKV();
+
+		const first = makeContext(makeEnv(db, kv));
+		await runWotd(first.c, NOW);
+		await first.settle();
+		const token = [...db.rows.values()][0]?.token;
+
+		const again = makeContext(makeEnv(db, kv));
+		const outcome = await postWotd(again.c, { now: NOW });
+		await again.settle();
+
+		expect(outcome).toEqual({
+			status: "resent",
+			token: token as string,
+			date: TODAY,
+		});
+		expect(discordPosts).toHaveLength(2);
+		// The word is unchanged, and the day still holds one history row: a repost
+		// replaces a bad embed, it does not consume another day's word.
+		expect(db.rows.size).toBe(1);
+		expect([...db.rows.values()][0]?.token).toBe(token as string);
+		const [before, after] = discordPosts as {
+			embeds: { title: string }[];
+		}[];
+		expect(after?.embeds[0]?.title).toBe(before?.embeds[0]?.title as string);
+	});
+
+	test("a manual run on an unrecorded day posts for the first time", async () => {
+		stubFetch();
+		const db = new FakeD1();
+		const { c, settle } = makeContext(makeEnv(db, new MemoryKV()));
+
+		const outcome = await postWotd(c, { now: NOW });
+		await settle();
+
+		expect(outcome.status).toBe("posted");
+		expect(discordPosts).toHaveLength(1);
+		expect(db.rows.size).toBe(1);
+	});
+
+	test("date: backfills an earlier day, recording that day and dating the embed", async () => {
+		stubFetch();
+		const db = new FakeD1();
+		const { c, settle } = makeContext(makeEnv(db, new MemoryKV()));
+
+		const outcome = await postWotd(c, { now: NOW, date: YESTERDAY });
+		await settle();
+
+		expect(outcome).toEqual({
+			status: "posted",
+			token: "utar",
+			date: YESTERDAY,
+		});
+		// The word belongs to 2026-07-02, so the channel post says so instead of
+		// claiming to be today's.
+		const title = (discordPosts[0] as { embeds: { title: string }[] }).embeds[0]
+			?.title;
+		expect(title).toContain(YESTERDAY);
+		expect(title).not.toContain("今日");
+		// Recorded under the backfilled day; today is still open for the cron.
+		expect([...db.rows.keys()]).toEqual([YESTERDAY]);
+	});
+
+	test("date: repeating a backfilled day reposts its word, keeping the one row", async () => {
+		stubFetch();
+		const db = new FakeD1();
+		const kv = new MemoryKV();
+
+		const first = makeContext(makeEnv(db, kv));
+		await postWotd(first.c, { now: NOW, date: YESTERDAY });
+		await first.settle();
+
+		const second = makeContext(makeEnv(db, kv));
+		expect(await postWotd(second.c, { now: NOW, date: YESTERDAY })).toEqual({
+			status: "resent",
+			token: "utar",
+			date: YESTERDAY,
+		});
+		await second.settle();
+
+		expect(discordPosts).toHaveLength(2);
+		expect([...db.rows.keys()]).toEqual([YESTERDAY]);
+		expect([...db.rows.values()][0]?.token).toBe("utar");
+	});
+
+	test("skipRecorded: the daily trigger leaves a day that already went out alone", async () => {
+		stubFetch();
+		const db = new FakeD1();
+		const kv = new MemoryKV();
+
+		const first = makeContext(makeEnv(db, kv));
+		await postWotd(first.c, { now: NOW, date: YESTERDAY });
+		await first.settle();
+
+		const second = makeContext(makeEnv(db, kv));
+		expect(
+			await postWotd(second.c, {
+				now: NOW,
+				date: YESTERDAY,
+				skipRecorded: true,
+			}),
+		).toEqual({ status: "already-posted", date: YESTERDAY });
+		await second.settle();
+
+		expect(discordPosts).toHaveLength(1);
+	});
+
+	test("date: a backfill never repeats a word that has since gone out", async () => {
+		stubFetch();
+		const db = new FakeD1();
+		const kv = new MemoryKV();
+
+		const today = makeContext(makeEnv(db, kv));
+		await runWotd(today.c, NOW);
+		await today.settle();
+		expect([...db.rows.values()][0]?.token).toBe("utar");
+
+		// `utar` is the fixture's only glossary-backed candidate and it is now in
+		// the recency window, so the earlier day finds nothing to post rather than
+		// repeating it.
+		const earlier = makeContext(makeEnv(db, kv));
+		const outcome = await postWotd(earlier.c, { now: NOW, date: YESTERDAY });
+		await earlier.settle();
+
+		expect(outcome).toEqual({
+			status: "skipped",
+			reason: "no glossary-backed candidate at all",
+		});
+		expect(discordPosts).toHaveLength(1);
+		expect([...db.rows.keys()]).toEqual([TODAY]);
 	});
 
 	test("upstream freq/list failure: caught, logged, no history row written", async () => {

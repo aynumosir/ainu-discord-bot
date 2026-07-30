@@ -10,7 +10,10 @@
  * src/handlers/wotd.ts) that:
  *
  *  1. no-ops if `WOTD_CHANNEL_ID` is unset (safe until a post channel is chosen)
- *  2. no-ops if today (JST) already has a `posted=1` row in `wotd_history`
+ *  2. no-ops when the daily trigger finds today (JST) already carrying a
+ *     `posted=1` row in `wotd_history`, so a re-fired cron cannot double-post.
+ *     A manual `/wotd` instead reposts that day's recorded word, and `date:`
+ *     aims the whole pipeline at an earlier day the cron missed.
  *  3. sources candidates from `/v1/freq/list`, filters them, deterministically
  *     picks one by `fnv1a(date)`, probing forward for a glossary hit
  *  4. enriches with a glossary gloss, up to 3 whole-word corpus examples from
@@ -562,10 +565,11 @@ interface Gloss {
 // A parenthesis holding 4+ characters explains the term; a shorter one belongs
 // to it — "(bee)hive" and 「(＝」 must not be cut the way 「（建物としての）家」 is.
 const ASIDE = /[(（]([^()（）]{4,})[)）]/g;
-// The separators dictionaries use between synonyms inside one gloss. The
-// halfwidth comma is deliberately absent: English glosses ("a well off, rich
-// man") are single labels, and Japanese ones use ，/、.
-const SYNONYM_SEPARATORS = /[、，；;・]/;
+// The separators dictionaries use between synonyms inside one gloss, halfwidth
+// forms included — 田村's entries punctuate with ､ (U+FF64), not 、. The ASCII
+// comma is deliberately absent: English glosses ("a well off, rich man") are
+// single labels, and Japanese ones use ，/、.
+const SYNONYM_SEPARATORS = /[、，；;・､･]/;
 const ARTICLE = /\b(?:a|an|the) +/gi;
 const TRAILING_MARKS = /^[\s.,。､、｡]+|[\s.,。､、｡]+$/g;
 
@@ -739,13 +743,19 @@ export function wotdEmbed(
 	entry: GlossaryEntry | undefined,
 	examples: readonly CorpusRow[],
 	lexeme?: MdbLexemeSearchRow,
+	/** The day the word belongs to, when that is not the day of posting. */
+	pastDate?: string,
 ) {
 	const meaning =
 		lexemeMeaning(lexeme, entry, examples) ??
 		glossaryMeaning(entry) ??
 		(entry ? "—" : "（辞書未登録 / not yet in the glossary）");
 	return baseEmbed("corpus.aynu.org · itak.aynu.org")
-		.title(`📅 今日のアイヌ語 / Word of the day: ${token}`)
+		.title(
+			pastDate
+				? `📅 ${pastDate}のアイヌ語 / Word of the day, ${pastDate}: ${token}`
+				: `📅 今日のアイヌ語 / Word of the day: ${token}`,
+		)
 		.fields(
 			{ name: "意味 / Meaning", value: meaning },
 			{ name: "表記 / Scripts", value: scriptsFieldValue(token) },
@@ -755,15 +765,23 @@ export function wotdEmbed(
 
 // ---------------------------------------------------------------- I/O ----
 
-async function alreadyPostedToday(
-	db: D1Database,
-	date: string,
-): Promise<boolean> {
+async function alreadyPosted(db: D1Database, date: string): Promise<boolean> {
 	const row = await db
 		.prepare("SELECT posted FROM wotd_history WHERE date = ?")
 		.bind(date)
 		.first<{ posted: number }>();
 	return row?.posted === 1;
+}
+
+async function postedToken(
+	db: D1Database,
+	date: string,
+): Promise<string | undefined> {
+	const row = await db
+		.prepare("SELECT token FROM wotd_history WHERE date = ?")
+		.bind(date)
+		.first<{ token: string }>();
+	return row?.token;
 }
 
 async function recentTokens(
@@ -775,6 +793,26 @@ async function recentTokens(
 		.bind(since)
 		.all<{ token: string }>();
 	return new Set(results.map((r) => r.token));
+}
+
+/** One recorded day, newest first — what `/wotd date:` offers as choices. */
+export interface WotdHistoryRow {
+	date: string;
+	token: string;
+	posted: number;
+}
+
+export async function historySince(
+	db: D1Database,
+	since: string,
+): Promise<WotdHistoryRow[]> {
+	const { results } = await db
+		.prepare(
+			"SELECT date, token, posted FROM wotd_history WHERE date >= ? ORDER BY date DESC",
+		)
+		.bind(since)
+		.all<WotdHistoryRow>();
+	return results;
 }
 
 async function upsertPosted(
@@ -792,9 +830,28 @@ async function upsertPosted(
 }
 
 export type WotdOutcome =
-	| { status: "posted"; token: string }
+	| { status: "posted"; token: string; date: string }
+	| { status: "resent"; token: string; date: string }
 	| { status: "already-posted"; date: string }
 	| { status: "skipped"; reason: string };
+
+export interface WotdOptions {
+	/** The clock that decides which JST day is "today"; tests inject a fixed instant. */
+	now?: Date;
+	/**
+	 * The JST day to post for, `YYYY-MM-DD`; defaults to today. Any past day
+	 * works: the pick is a pure function of the date, so a day the cron missed
+	 * yields the word it would have posted then, and posting it records that
+	 * day rather than consuming today's word.
+	 */
+	date?: string;
+	/**
+	 * Leave a day that already went out untouched — the daily trigger's contract,
+	 * so a re-fired cron never doubles a post. `/wotd` does not set it: a manual
+	 * run is deliberate, and reposting a day costs nothing but the message.
+	 */
+	skipRecorded?: boolean;
+}
 
 /**
  * The context slice the WOTD pipeline needs — satisfied by both `CronContext`
@@ -850,6 +907,7 @@ async function publish(
 	c: WotdContext,
 	channelId: string,
 	selection: WotdSelection,
+	pastDate?: string,
 ): Promise<void> {
 	const res = await c.rest("POST", $channels$_$messages, [channelId], {
 		embeds: [
@@ -858,6 +916,7 @@ async function publish(
 				selection.entry,
 				selection.examples,
 				selection.lexeme,
+				pastDate,
 			).toJSON(),
 		],
 	});
@@ -867,17 +926,20 @@ async function publish(
 }
 
 /**
- * Runs the whole pick/enrich/post pipeline once and reports what happened.
- * Upstream/Discord failures throw — the caller decides how to surface them.
- * The history row is only written after a confirmed-successful post, so a
- * failed run always retries safely next time.
+ * Runs the whole pick/enrich/post pipeline once for one JST day and reports
+ * what happened. Upstream/Discord failures throw — the caller decides how to
+ * surface them. The history row is only written after a confirmed-successful
+ * post, so a failed run always retries safely next time.
  *
- * `now` defaults to the real clock; tests inject a fixed `Date` so the JST
- * date (and therefore the deterministic hash pick) is reproducible.
+ * `options.date` defaults to today in JST; `/wotd date:` names an earlier day
+ * to backfill, and tests fix both the clock and the day so the deterministic
+ * hash pick is reproducible. A day that already holds a word posts that word
+ * again rather than picking a new one, unless `options.skipRecorded` says to
+ * leave it alone.
  */
 export async function postWotd(
 	c: WotdContext,
-	now: Date = new Date(),
+	options: WotdOptions = {},
 ): Promise<WotdOutcome> {
 	const channelId = c.env.WOTD_CHANNEL_ID;
 	if (!channelId) {
@@ -885,10 +947,31 @@ export async function postWotd(
 	}
 
 	const db = c.env.DB;
-	const today = jstDateString(now);
+	const today = jstDateString(options.now);
+	const date = options.date ?? today;
+	// A post for an earlier day says which day it is, so the channel never reads
+	// a backfilled word as today's.
+	const pastDate = date === today ? undefined : date;
 
-	if (await alreadyPostedToday(db, today)) {
-		return { status: "already-posted", date: today };
+	if (options.skipRecorded && (await alreadyPosted(db, date))) {
+		return { status: "already-posted", date };
+	}
+
+	// A day that already has a word keeps it: the recorded token is rebuilt from
+	// the current sources and posted again, so a second run replaces a wrong embed
+	// without spending another day's word. Only an unrecorded day picks.
+	const posted = await postedToken(db, date);
+	if (posted !== undefined) {
+		const table = await getGlossary(c.env, c.executionCtx);
+		const enriched = await enrichToken(c, table, posted);
+		if (!enriched) {
+			return {
+				status: "skipped",
+				reason: `${posted} has no glossary row to rebuild from`,
+			};
+		}
+		await publish(c, channelId, enriched.selection, pastDate);
+		return { status: "resent", token: posted, date };
 	}
 
 	const rows = await freqList(c.env, {
@@ -896,9 +979,11 @@ export async function postWotd(
 		includeStopwords: false,
 		minCount: CANDIDATE_MIN_COUNT,
 	});
+	// Rows after `date` count as recent too, so backfilling a missed day never
+	// repeats a word that has since gone out.
 	const excluded = await recentTokens(
 		db,
-		shiftDateString(today, -RECENT_WINDOW_DAYS),
+		shiftDateString(date, -RECENT_WINDOW_DAYS),
 	);
 	const candidates = filterCandidates(rows, excluded);
 	if (candidates.length === 0) {
@@ -909,7 +994,7 @@ export async function postWotd(
 	}
 
 	const table = await getGlossary(c.env, c.executionCtx);
-	const startIndex = pickIndex(today, candidates.length);
+	const startIndex = pickIndex(date, candidates.length);
 	let selected: WotdSelection | undefined;
 	// First glossary-backed candidate whose MDB lexemes were ambiguous —
 	// used as a fallback (glossary gloss only) so an all-ambiguous day still
@@ -945,9 +1030,9 @@ export async function postWotd(
 		}
 	}
 
-	await publish(c, channelId, selected);
-	await upsertPosted(db, today, selected.token);
-	return { status: "posted", token: selected.token };
+	await publish(c, channelId, selected, pastDate);
+	await upsertPosted(db, date, selected.token);
+	return { status: "posted", token: selected.token, date };
 }
 
 /**
@@ -960,7 +1045,7 @@ export async function runWotd(
 	now: Date = new Date(),
 ): Promise<void> {
 	try {
-		const outcome = await postWotd(c, now);
+		const outcome = await postWotd(c, { now, skipRecorded: true });
 		switch (outcome.status) {
 			case "posted":
 				console.log(`[wotd] posted ${outcome.token}`);

@@ -7,7 +7,7 @@ import { corpusDialectAutocomplete, corpusHandler } from "./handlers/corpus.js";
 import { glossaryAutocomplete, glossaryHandler } from "./handlers/glossary.js";
 import { lookupHandler } from "./handlers/lookup.js";
 import { quiz, quizAnswer, quizNext } from "./handlers/quiz.js";
-import { wotdHandler } from "./handlers/wotd.js";
+import { wotdDateAutocomplete, wotdHandler } from "./handlers/wotd.js";
 import { type AppEnv, safeHandler } from "./lib/errors.js";
 import { runArchive } from "./services/archive.js";
 
@@ -34,7 +34,7 @@ app.command("quiz", safeHandler(quiz));
 app.component("quiz", quizAnswer);
 app.component("quiz-next", quizNext);
 app.command("ask", safeHandler(askHandler));
-app.command("wotd", safeHandler(wotdHandler));
+app.autocomplete("wotd", wotdDateAutocomplete, safeHandler(wotdHandler));
 
 // Explicit cron keys — must match wrangler.jsonc's triggers.crons exactly,
 // one handler per trigger. (Previously a single `app.cron("", runWotd)`

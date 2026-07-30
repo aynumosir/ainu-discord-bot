@@ -101,6 +101,14 @@ export const commands = [
 	// a failed daily post, hidden from regular members.
 	new Command(
 		"wotd",
-		"Post today's word of the day now (retry after a failed cron run)",
-	).default_member_permissions("32"),
+		"Post the word of the day now — today, or a past day the cron run missed",
+	)
+		.options(
+			new Option(
+				"date",
+				"Day to post for (YYYY-MM-DD, JST) — defaults to today",
+				"String",
+			).autocomplete(),
+		)
+		.default_member_permissions("32"),
 ];
