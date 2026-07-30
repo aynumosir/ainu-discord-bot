@@ -47,6 +47,16 @@ const EXAMPLE_MAX = 3;
 const EXAMPLE_FIELD_MAX = 1024;
 const GLOSSARY_LOOKUP_LIMIT = 5;
 const MDB_LEXEME_LOOKUP_LIMIT = 20;
+// Past this a Japanese gloss is an explanation, not a label: 神 stays, but
+// 神のように立派な belongs in the note.
+const LABEL_MAX_CHARS = 5;
+const LABEL_SEPARATOR = " / ";
+const GLOSS_SEPARATOR = " · ";
+const NOTE_MAX = 180;
+// Gloss ranking ladder — see rankGlosses.
+const SCORE_ATTESTED = 4;
+const SCORE_AGREES = 2;
+const SCORE_CHECKABLE = 1;
 
 // ---------------------------------------------------------------- pure ----
 
@@ -299,31 +309,91 @@ const GLOSS_TERM_RUNS: readonly RegExp[] = [
 	/\p{Script=Hiragana}+/gu,
 ];
 
+/** English words of 3+ letters — the Latin-script counterpart of `GLOSS_TERM_RUNS`. */
+const LATIN_WORD = /[A-Za-z]{3,}/g;
+
+/**
+ * The meaning-bearing substrings of a gloss. A single Han character carries
+ * meaning (corpus translations often say just 薪); hiragana needs >= 3 chars —
+ * 2-char runs like する or して are grammatical filler matching almost any
+ * translation.
+ */
+function glossTerms(gloss: string): string[] {
+	const terms: string[] = [];
+	for (const re of GLOSS_TERM_RUNS) {
+		const min = re.source.includes("Han")
+			? 1
+			: re.source.includes("Hiragana")
+				? 3
+				: 2;
+		for (const term of gloss.match(re) ?? []) {
+			if (term.length >= min) terms.push(term);
+		}
+	}
+	return terms;
+}
+
+function latinWords(text: string): string[] {
+	return text.toLowerCase().match(LATIN_WORD) ?? [];
+}
+
+function textAttestsGloss(gloss: string, text: string): boolean {
+	return glossTerms(gloss).some((term) => text.includes(term));
+}
+
+/** Whether a gloss offers anything that can be checked against another text. */
+function hasCheckableTerm(gloss: string): boolean {
+	return glossTerms(gloss).length > 0 || latinWords(gloss).length > 0;
+}
+
+/**
+ * Whether two meaning strings from different layers — an MDB gloss and a
+ * glossary row — name the same thing, via a shared CJK term or English word.
+ */
+function meaningsAgree(a: string, b: string): boolean {
+	if (a.trim() === "" || b.trim() === "") return false;
+	if (textAttestsGloss(a, b) || textAttestsGloss(b, a)) return true;
+	const words = new Set(latinWords(b));
+	return latinWords(a).some((word) => words.has(word));
+}
+
+const CJK_CHAR = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
+// Braces and ｟…｠ (a tape-recording marker in 田村's entries) are harvest
+// residue: MDB's pools carry mid-entry cuts such as `.} ｟テープ｠` and `熊(＝`.
+const GLOSS_RESIDUE = /[{}｛｝｟｠]/u;
+
+function balancedParens(gloss: string): boolean {
+	return (
+		(gloss.match(/[(（]/g) ?? []).length ===
+		(gloss.match(/[)）]/g) ?? []).length
+	);
+}
+
+/** Drops the harvest residue and the misfiled glosses of the other language. */
+function glossPool(glosses: readonly string[], japanese: boolean): string[] {
+	const inLanguage = glosses.filter(
+		(gloss) => CJK_CHAR.test(gloss) === japanese && gloss.trim() !== "",
+	);
+	const clean = inLanguage.filter(
+		(gloss) => !GLOSS_RESIDUE.test(gloss) && balancedParens(gloss),
+	);
+	// A lexeme whose every gloss looks like residue still needs a meaning.
+	return clean.length > 0 ? clean : inLanguage;
+}
+
+function exampleContextText(examples: readonly CorpusRow[]): string {
+	return examples.map((ex) => `${ex.text}\n${ex.translation ?? ""}`).join("\n");
+}
+
 function lexemeMatchesExampleContext(
 	row: MdbLexemeSearchRow,
 	examples: readonly CorpusRow[],
 ): boolean {
-	const text = examples
-		.map((ex) => `${ex.text}\n${ex.translation ?? ""}`)
-		.join("\n");
+	const text = exampleContextText(examples);
 	if (!text.trim()) return false;
-	for (const gloss of [...row.gloss_jp, ...row.gloss_en]) {
-		for (const re of GLOSS_TERM_RUNS) {
-			for (const term of gloss.match(re) ?? []) {
-				// A single Han character carries meaning (corpus translations often
-				// say just 薪); hiragana needs >= 3 chars — 2-char runs like する
-				// or して are grammatical filler matching almost any translation.
-				const min = re.source.includes("Han")
-					? 1
-					: re.source.includes("Hiragana")
-						? 3
-						: 2;
-				if (term.length < min) continue;
-				if (text.includes(term)) return true;
-			}
-		}
-	}
-	return false;
+	return [...row.gloss_jp, ...row.gloss_en].some((gloss) =>
+		textAttestsGloss(gloss, text),
+	);
 }
 
 /**
@@ -440,17 +510,230 @@ export function exampleFieldValue(rows: readonly CorpusRow[]): string {
 	return truncate(formatExample(rows[0]!), EXAMPLE_FIELD_MAX);
 }
 
-/** Pure embed builder — the only non-pure step left is `.toJSON()` at the call site (none here). */
-function lexemeMeaning(
-	lexeme: MdbLexemeSearchRow | undefined,
+/**
+ * MDB carries one lexeme's glosses as a pool harvested from several
+ * dictionaries, in no meaningful order — `sine` lists ある before 一, so taking
+ * the first one headlined the numeral "one" as ある. Rank by what the post
+ * itself corroborates: a gloss the day's examples attest, then a gloss the
+ * glossary row agrees with, then a gloss that at least offers a term to check.
+ * `sine` ends 一 · ひとつの，１ · ある — the ある of `sine an to`「或る日」carries
+ * nothing checkable and reads as 有る/在る out of position, so it goes last.
+ * Two glosses with the same support go shortest first, since the pool mixes
+ * bare headwords with whole dictionary paragraphs (`wakka` carries both 水 and
+ * 水(冷水も熱い湯も､ ただし飲用でないもの…)) and the headword leads better.
+ * Unsupported glosses keep source order: brevity says nothing about which sense
+ * is primary, and `cise` would headline as "a wife" over "a house; a (bee)hive".
+ */
+export function rankGlosses(
+	glosses: readonly string[],
+	contextText: string,
+	curated: string,
+): string[] {
+	const attested = contextText.trim() !== "";
+	const score = (gloss: string) =>
+		(attested && textAttestsGloss(gloss, contextText) ? SCORE_ATTESTED : 0) +
+		(meaningsAgree(gloss, curated) ? SCORE_AGREES : 0) +
+		(hasCheckableTerm(gloss) ? SCORE_CHECKABLE : 0);
+	return glosses
+		.map((gloss, index) => ({ gloss, index, score: score(gloss) }))
+		.sort(
+			(a, b) =>
+				b.score - a.score ||
+				(a.score >= SCORE_AGREES ? a.gloss.length - b.gloss.length : 0) ||
+				a.index - b.index,
+		)
+		.map((scored) => scored.gloss);
+}
+
+/**
+ * A gloss reduced to what a label needs, plus what it gave up. Dictionaries
+ * write a headword, its synonyms and its usage note in one string
+ * (`金持ち，物持ち，裕福な人…`, `水(冷水も熱い湯も…)`), each with its own
+ * punctuation; `label` is the headword alone, `rest` the synonyms and `asides`
+ * the parenthesised explanations, which the note carries. A bare number is
+ * dropped — 「ひとつの，１」 restates its own headword as a digit.
+ */
+interface Gloss {
+	label: string;
+	rest: string[];
+	asides: string[];
+}
+
+// A parenthesis holding 4+ characters explains the term; a shorter one belongs
+// to it — "(bee)hive" and 「(＝」 must not be cut the way 「（建物としての）家」 is.
+const ASIDE = /[(（]([^()（）]{4,})[)）]/g;
+// The separators dictionaries use between synonyms inside one gloss. The
+// halfwidth comma is deliberately absent: English glosses ("a well off, rich
+// man") are single labels, and Japanese ones use ，/、.
+const SYNONYM_SEPARATORS = /[、，；;・]/;
+const ARTICLE = /\b(?:a|an|the) +/gi;
+const TRAILING_MARKS = /^[\s.,。､、｡]+|[\s.,。､、｡]+$/g;
+
+function glossOf(raw: string, japanese: boolean): Gloss | undefined {
+	const asides: string[] = [];
+	// The aside leaves a separator behind, never a splice: 「鳥(鳥類の総称)鶏」
+	// holds two synonyms and must not close up into 鳥鶏.
+	const text = raw.replace(ASIDE, () => {
+		// The note quotes the gloss whole: 「建物としての」 on its own says nothing,
+		// 「（建物としての）家」 says what it was there to say.
+		asides.push(raw.trim());
+		return japanese ? "、" : " ";
+	});
+	const parts = (japanese ? text.split(SYNONYM_SEPARATORS) : [text])
+		.map((part) => (japanese ? part : part.replace(ARTICLE, "")))
+		.map((part) => part.replace(TRAILING_MARKS, "").trim())
+		.filter((part) => part !== "" && !/^[\p{N}]+$/u.test(part));
+	const [label, ...rest] = parts;
+	if (label === undefined) return undefined;
+	return { label, rest, asides };
+}
+
+/**
+ * One label per sense, most supported first. Glosses whose labels restate one
+ * another are one sense (`神` and `神のように立派な`, `一` and `一つの`). Within a
+ * sense the fullest form wins, but only where the extra characters are kana —
+ * an adnominal tail (一 → 一つの) belongs to the same word, whereas another
+ * kanji is a second word glued on by the harvest (鳥 stays 鳥, not 鳥鶏).
+ */
+function senseLabels(glosses: readonly Gloss[]): string[] {
+	const senses: string[][] = [];
+	for (const { label } of glosses) {
+		const sense = senses.find((members) =>
+			members.some((m) => m.includes(label) || label.includes(m)),
+		);
+		if (sense) sense.push(label);
+		else senses.push([label]);
+	}
+	return senses.map((members) => {
+		const base = members.reduce((a, b) => (b.length < a.length ? b : a));
+		const inflected = members.filter(
+			(m) =>
+				m.length <= LABEL_MAX_CHARS &&
+				m.includes(base) &&
+				/^\p{Script=Hiragana}*$/u.test(m.replace(base, "")),
+		);
+		return inflected.reduce((a, b) => (b.length > a.length ? b : a), base);
+	});
+}
+
+/**
+ * The English for a Japanese label. MDB's two gloss arrays are not parallel —
+ * `kur²` opens with 人 in Japanese and "(a) shadow" in English — so nothing may
+ * be paired by position. The glossary row is aligned by construction, so it
+ * anchors the pair: English is shown only for the sense that row describes,
+ * taking whichever wording is shorter. A sense the row does not cover (the
+ * `nina` a hearth example picked, say) is left in Japanese alone rather than
+ * printed beside another sense's English.
+ */
+function englishFor(
+	jpLabel: string | undefined,
+	enLabels: readonly string[],
+	curatedJp: string,
+	curatedEn: string,
 ): string | undefined {
-	if (!lexeme) return undefined;
+	const anchored = jpLabel !== undefined && meaningsAgree(jpLabel, curatedJp);
+	const candidates = anchored
+		? [curatedEn, ...enLabels.filter((en) => meaningsAgree(en, curatedEn))]
+		: // With no curated English there is nothing to anchor to, but a lexeme
+			// with exactly one English gloss has only one sense to get wrong.
+			curatedEn === "" && enLabels.length === 1
+			? enLabels
+			: [];
+	return candidates
+		.filter((c) => c !== "")
+		.reduce<string | undefined>(
+			(best, c) => (best === undefined || c.length < best.length ? c : best),
+			undefined,
+		);
+}
+
+/** The nuance the labels left out: the other synonyms and the usage notes. */
+function meaningNote(
+	glosses: readonly Gloss[],
+	shown: readonly string[],
+): string {
+	const extras = glosses
+		// A gloss with an aside is quoted whole, so its own label would repeat.
+		.flatMap(({ label, rest, asides }) =>
+			asides.length > 0 ? [...rest, ...asides] : [label, ...rest],
+		)
+		// A label already on display, or any fragment of one, adds nothing.
+		.filter((extra) => !shown.some((s) => s.includes(extra)));
+	const unique = extras.filter(
+		(extra, i) =>
+			extras.indexOf(extra) === i &&
+			!extras.some((other) => other !== extra && other.includes(extra)),
+	);
+	if (unique.length === 0) return "";
+	return `\n-# ${truncate(unique.join(GLOSS_SEPARATOR), NOTE_MAX)}`;
+}
+
+/** One `日本語 / English` label, with everything it left out in a note under it. */
+function meaningField(
+	jpGlosses: readonly Gloss[],
+	enGlosses: readonly Gloss[],
+	curatedJp: string,
+	curatedEn: string,
+): string | undefined {
+	const jp = senseLabels(jpGlosses)[0];
+	const en = englishFor(jp, senseLabels(enGlosses), curatedJp, curatedEn);
+	const label = [jp, en].filter(Boolean).join(LABEL_SEPARATOR);
+	if (label === "") return undefined;
 	return (
-		[lexeme.gloss_jp[0], lexeme.gloss_en[0]].filter(Boolean).join(" · ") ||
-		undefined
+		label + meaningNote([...jpGlosses, ...enGlosses], [jp ?? "", en ?? ""])
 	);
 }
 
+function glossesOf(pooled: readonly string[], japanese: boolean): Gloss[] {
+	return pooled
+		.map((gloss) => glossOf(gloss, japanese))
+		.filter((gloss): gloss is Gloss => gloss !== undefined);
+}
+
+function curatedGlosses(text: string, japanese: boolean): Gloss[] {
+	return glossesOf(glossPool([text], japanese), japanese);
+}
+
+/** The meaning a glossary row alone can carry — no MDB sense to draw on. */
+function glossaryMeaning(entry: GlossaryEntry | undefined): string | undefined {
+	if (!entry) return undefined;
+	const jp = entry.日本語 ?? "";
+	const en = entry.English ?? "";
+	return meaningField(
+		curatedGlosses(jp, true),
+		curatedGlosses(en, false),
+		jp,
+		en,
+	);
+}
+
+function lexemeMeaning(
+	lexeme: MdbLexemeSearchRow | undefined,
+	entry: GlossaryEntry | undefined,
+	examples: readonly CorpusRow[],
+): string | undefined {
+	if (!lexeme) return undefined;
+	const context = exampleContextText(examples);
+	const curatedJp = entry?.日本語 ?? "";
+	const curatedEn = entry?.English ?? "";
+	// The curated row joins the Japanese pool so that a curated 一 and MDB's
+	// 一つの land in one sense — the label is then the fullest form of that one
+	// word, not whichever layer happened to be consulted.
+	const jp = [
+		...glossesOf(
+			rankGlosses(glossPool(lexeme.gloss_jp, true), context, curatedJp),
+			true,
+		),
+		...curatedGlosses(curatedJp, true),
+	];
+	const en = [
+		...glossesOf(glossPool(lexeme.gloss_en, false), false),
+		...curatedGlosses(curatedEn, false),
+	];
+	return meaningField(jp, en, curatedJp, curatedEn);
+}
+
+/** Pure embed builder — the only non-pure step left is `.toJSON()` at the call site (none here). */
 export function wotdEmbed(
 	token: string,
 	entry: GlossaryEntry | undefined,
@@ -458,10 +741,9 @@ export function wotdEmbed(
 	lexeme?: MdbLexemeSearchRow,
 ) {
 	const meaning =
-		lexemeMeaning(lexeme) ??
-		(entry
-			? [entry.日本語, entry.English].filter(Boolean).join(" · ") || "—"
-			: "（辞書未登録 / not yet in the glossary）");
+		lexemeMeaning(lexeme, entry, examples) ??
+		glossaryMeaning(entry) ??
+		(entry ? "—" : "（辞書未登録 / not yet in the glossary）");
 	return baseEmbed("corpus.aynu.org · itak.aynu.org")
 		.title(`📅 今日のアイヌ語 / Word of the day: ${token}`)
 		.fields(
@@ -526,6 +808,65 @@ export interface WotdContext {
 }
 
 /**
+ * Everything the embed needs for one token — corpus examples, the MDB sense the
+ * examples support, the glossary row. `undefined` when the glossary has no row
+ * for the token; `ambiguous` when the token's MDB homographs could not be told
+ * apart, in which case the selection carries no lexeme.
+ */
+async function enrichToken(
+	c: WotdContext,
+	table: GlossaryTable,
+	token: string,
+): Promise<{ selection: WotdSelection; ambiguous: boolean } | undefined> {
+	const entry = glossaryExactEntry(table, token);
+	if (!entry) return undefined;
+
+	const exampleRows = await searchCorpus(c.env, {
+		q: token,
+		lang: "ain",
+		limit: EXAMPLE_FETCH_LIMIT,
+	});
+	const examples = selectExamples(exampleRows, token);
+	const lexemeRows = await searchLexemes(c.env, token, MDB_LEXEME_LOOKUP_LIMIT);
+	const { lexeme, ambiguous } = selectWotdLexeme(
+		token,
+		lexemeRows.results,
+		examples,
+	);
+	return {
+		selection: {
+			token,
+			entry,
+			examples: ambiguous
+				? examples
+				: filterExamplesBySense(examples, lexeme, lexemeRows.results, token),
+			lexeme: ambiguous ? undefined : lexeme,
+		},
+		ambiguous,
+	};
+}
+
+async function publish(
+	c: WotdContext,
+	channelId: string,
+	selection: WotdSelection,
+): Promise<void> {
+	const res = await c.rest("POST", $channels$_$messages, [channelId], {
+		embeds: [
+			wotdEmbed(
+				selection.token,
+				selection.entry,
+				selection.examples,
+				selection.lexeme,
+			).toJSON(),
+		],
+	});
+	if (!res.ok) {
+		throw new Error(`Discord post failed: HTTP ${res.status}`);
+	}
+}
+
+/**
  * Runs the whole pick/enrich/post pipeline once and reports what happened.
  * Upstream/Discord failures throw — the caller decides how to surface them.
  * The history row is only written after a confirmed-successful post, so a
@@ -579,44 +920,15 @@ export async function postWotd(
 		const index = (startIndex + step) % candidates.length;
 		// biome-ignore lint/style/noNonNullAssertion: index is derived from candidates.length > 0.
 		const token = candidates[index]!;
-		const entry = glossaryExactEntry(table, token);
-		if (!entry) continue;
-
-		const exampleRows = await searchCorpus(c.env, {
-			q: token,
-			lang: "ain",
-			limit: EXAMPLE_FETCH_LIMIT,
-		});
-		const examples = selectExamples(exampleRows, token);
-		const lexemeRows = await searchLexemes(
-			c.env,
-			token,
-			MDB_LEXEME_LOOKUP_LIMIT,
-		);
-		const { lexeme, ambiguous } = selectWotdLexeme(
-			token,
-			lexemeRows.results,
-			examples,
-		);
-		if (ambiguous) {
+		const enriched = await enrichToken(c, table, token);
+		if (!enriched) continue;
+		if (enriched.ambiguous) {
 			console.warn(`[wotd] ${token} has ambiguous MDB lexemes — probing next`);
-			if (!ambiguousFallback) {
-				// Remember the first ambiguous candidate: glossary gloss only.
-				ambiguousFallback = { token, entry, examples, lexeme: undefined };
-			}
+			// Remember the first ambiguous candidate: glossary gloss only.
+			ambiguousFallback ??= enriched.selection;
 			continue;
 		}
-		selected = {
-			token,
-			entry,
-			examples: filterExamplesBySense(
-				examples,
-				lexeme,
-				lexemeRows.results,
-				token,
-			),
-			lexeme,
-		};
+		selected = enriched.selection;
 		break;
 	}
 	if (!selected) {
@@ -633,20 +945,7 @@ export async function postWotd(
 		}
 	}
 
-	const res = await c.rest("POST", $channels$_$messages, [channelId], {
-		embeds: [
-			wotdEmbed(
-				selected.token,
-				selected.entry,
-				selected.examples,
-				selected.lexeme,
-			).toJSON(),
-		],
-	});
-	if (!res.ok) {
-		throw new Error(`Discord post failed: HTTP ${res.status}`);
-	}
-
+	await publish(c, channelId, selected);
 	await upsertPosted(db, today, selected.token);
 	return { status: "posted", token: selected.token };
 }

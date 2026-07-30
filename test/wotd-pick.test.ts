@@ -9,9 +9,11 @@ import {
 	jstDateString,
 	pickIndex,
 	probeForGlossaryHit,
+	rankGlosses,
 	selectExamples,
 	selectWotdLexeme,
 	shiftDateString,
+	wotdEmbed,
 } from "../src/cron/wotd.js";
 import { fnv1a } from "../src/lib/hash.js";
 import type { CorpusRow } from "../src/services/corpus.js";
@@ -767,5 +769,212 @@ describe("review follow-up regressions", () => {
 		expect(
 			filterExamplesBySense(examples, fire, [fire, place], "nina"),
 		).toEqual(examples);
+	});
+});
+
+describe("WOTD meaning field", () => {
+	const lex = (
+		partial: Partial<MdbLexemeSearchRow> &
+			Pick<MdbLexemeSearchRow, "id" | "lemma">,
+	): MdbLexemeSearchRow => ({
+		kana: "",
+		pos: "n",
+		gloss_en: [],
+		gloss_jp: [],
+		bound: false,
+		dialects: [],
+		variations: [],
+		recordings: 0,
+		morphemes: [],
+		...partial,
+	});
+
+	const row = (text: string, translation: string): CorpusRow => ({
+		id: "oda/1",
+		text,
+		translation,
+		dialect: "小田洲",
+		author: null,
+		collection: null,
+		document: null,
+		uri: null,
+	});
+
+	const meaningOf = (
+		entry: GlossaryEntry | undefined,
+		examples: readonly CorpusRow[],
+		lexeme?: MdbLexemeSearchRow,
+	): string | undefined => {
+		const { fields } = wotdEmbed("sine", entry, examples, lexeme).toJSON() as {
+			fields: { name: string; value: string }[];
+		};
+		return fields.find((f) => f.name.includes("Meaning"))?.value;
+	};
+
+	// mdb's gloss pool for `sine`, in API order — ある is a dictionary's rendering
+	// of `sine an to`「ある日」and happens to sit first.
+	const sine = lex({
+		id: "sine",
+		lemma: "sine",
+		pos: "num",
+		gloss_jp: ["ある", "ひとつの，１", "一", "一つの"],
+	});
+	const sineEntry: GlossaryEntry = {
+		Aynu: "sine",
+		日本語: "一",
+		English: "one",
+		sheetName: "number",
+	};
+
+	test("sine is one label, 一つの / one, with the rest demoted to the note", () => {
+		const meaning = meaningOf(
+			sineEntry,
+			[
+				row(
+					"sine cise 'ani ike taa, 'ohta 'ahun manu.",
+					"一軒家があって、そこに入ったとさ。",
+				),
+			],
+			sine,
+		);
+		expect(meaning).toBe("一つの / one\n-# ひとつの · ある");
+	});
+
+	test("the label holds when no example attests any gloss", () => {
+		expect(meaningOf(sineEntry, [], sine)).toBe(
+			"一つの / one\n-# ひとつの · ある",
+		);
+	});
+
+	test("a kana tail joins the label, another kanji does not", () => {
+		const cikap = lex({
+			id: "cikap.n",
+			lemma: "cikap",
+			gloss_jp: ["鳥", "鳥，鶏", "ニワトリ", "鳥鶏"],
+			gloss_en: ["a bird"],
+		});
+		// 鳥鶏 is two words the harvest glued together — 一つの is one word inflected.
+		expect(meaningOf(undefined, [], cikap)).toStartWith("鳥 / bird");
+	});
+
+	test("harvest residue and misfiled English never reach the label", () => {
+		const kamuy = lex({
+			id: "kamuy.n",
+			lemma: "kamuy",
+			gloss_jp: ["神", "a god.", ".} ｟テープ｠", "熊(＝", "熊"],
+			gloss_en: ["a god", "a bear"],
+		});
+		const entry: GlossaryEntry = {
+			Aynu: "kamuy",
+			日本語: "神",
+			English: "god",
+			sheetName: "world",
+		};
+		expect(meaningOf(entry, [], kamuy)).toBe("神 / god\n-# 熊 · bear");
+	});
+
+	test("the synonyms and the usage note behind a label go to the note", () => {
+		const wakka = lex({
+			id: "wakka.n",
+			lemma: "wakka",
+			gloss_jp: [
+				"水(冷水も熱い湯も､ ただし飲用でないもの､ 場合によっては清涼飲料も含む)",
+				"水",
+			],
+			gloss_en: ["water"],
+		});
+		const entry: GlossaryEntry = {
+			Aynu: "wakka",
+			日本語: "水",
+			English: "water",
+			sheetName: "nature",
+		};
+		expect(meaningOf(entry, [], wakka)).toBe(
+			"水 / water\n-# 水(冷水も熱い湯も､ ただし飲用でないもの､ 場合によっては清涼飲料も含む)",
+		);
+	});
+
+	test("the shorter of the two English wordings wins", () => {
+		const hekaci = lex({
+			id: "hekaci.n",
+			lemma: "hekaci",
+			gloss_jp: ["男の子"],
+			gloss_en: ["a youth; a young boy"],
+		});
+		const entry: GlossaryEntry = {
+			Aynu: "hekaci",
+			日本語: "男の子",
+			English: "boy",
+			sheetName: "people",
+		};
+		expect(meaningOf(entry, [], hekaci)).toStartWith("男の子 / boy");
+	});
+
+	test("a sense the glossary does not cover stays in Japanese alone", () => {
+		const mash = lex({
+			id: "nina.vt",
+			lemma: "nina²",
+			pos: "vt",
+			gloss_jp: ["～をこねつぶす"],
+		});
+		const firewood: GlossaryEntry = {
+			Aynu: "nina",
+			日本語: "薪を採る",
+			English: "gather firewood",
+			sheetName: "general_verb",
+		};
+		// "gather firewood" belongs to the sense the examples ruled out — pairing it
+		// with こねつぶす would state something the layers never claimed.
+		expect(
+			meaningOf(firewood, [row("kem nina", "筋子をこねつぶす")], mash),
+		).toBe("～をこねつぶす\n-# 薪を採る · gather firewood");
+	});
+
+	test("English is not paired across senses even when both sides have one gloss", () => {
+		// MDB's kur² opens with 人 in Japanese and (a) shadow in English.
+		const kur = lex({
+			id: "kur.n",
+			lemma: "kur²",
+			gloss_jp: ["人", "影"],
+			gloss_en: ["(a) shadow"],
+		});
+		const person: GlossaryEntry = {
+			Aynu: "kur",
+			日本語: "人",
+			English: "person",
+			sheetName: "people",
+		};
+		expect(meaningOf(person, [], kur)).toStartWith("人 / person");
+	});
+
+	test("without an mdb lexeme the glossary row is the meaning", () => {
+		expect(meaningOf(sineEntry, [])).toBe("一 / one");
+	});
+
+	test("rankGlosses: example attestation outranks glossary agreement", () => {
+		const glosses = ["ヒラメ", "薪を採る"];
+		expect(rankGlosses(glosses, "薪を採りに行った", "ヒラメ")[0]).toBe(
+			"薪を採る",
+		);
+	});
+
+	test("rankGlosses: the headword wins over the dictionary paragraph beside it", () => {
+		const wakka = [
+			"水(冷水も熱い湯も､ ただし飲用でないもの､ 場合によっては清涼飲料も含む)",
+			"水",
+		];
+		expect(rankGlosses(wakka, "wakka ku\n水を飲む", "水")[0]).toBe("水");
+	});
+
+	test("rankGlosses: unsupported glosses keep mdb's order — brevity is not evidence", () => {
+		const cise = ["a house; a (bee)hive", "a wife"];
+		expect(rankGlosses(cise, "", "")[0]).toBe("a house; a (bee)hive");
+	});
+
+	test("rankGlosses: a gloss with nothing checkable in it sinks to the end", () => {
+		expect(rankGlosses(["ある", "ひとつの，１"], "", "")).toEqual([
+			"ひとつの，１",
+			"ある",
+		]);
 	});
 });
