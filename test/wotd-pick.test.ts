@@ -582,21 +582,32 @@ describe("selectExamples", () => {
 		]);
 	});
 
+	test("a headword or gloss pair copied from a word list is not a sentence", () => {
+		const rows = [
+			row({ text: "terke" }),
+			row({ text: "terke wa" }),
+			row({ text: "u terke noyne" }),
+		];
+		expect(selectExamples(rows, "terke").map((r) => r.text)).toEqual([
+			"u terke noyne",
+		]);
+	});
+
 	test("matches the token accent-, case- and apostrophe-insensitively", () => {
 		const rows = [row({ text: "hoski 'oman nanna" })];
 		expect(selectExamples(rows, "hoski")).toHaveLength(1);
 		expect(selectExamples(rows, "HOSKI")).toHaveLength(1);
 		expect(selectExamples(rows, "’oman")).toHaveLength(1);
 		expect(selectExamples(rows, "oman")).toHaveLength(1);
-		expect(selectExamples([row({ text: "sínep ne" })], "sinep")).toHaveLength(
-			1,
-		);
+		expect(
+			selectExamples([row({ text: "sínep ne na" })], "sinep"),
+		).toHaveLength(1);
 	});
 
 	test("matches NFD-decomposed corpus text (combining accents are not word breaks)", () => {
 		// í as i + U+0301 — the splitter must not break sínep at the accent.
 		expect(
-			selectExamples([row({ text: "si\u0301nep ne" })], "sinep"),
+			selectExamples([row({ text: "si\u0301nep ne na" })], "sinep"),
 		).toHaveLength(1);
 	});
 
@@ -615,33 +626,33 @@ describe("selectExamples", () => {
 
 	test("ignores rows with a null or blank translation", () => {
 		const rows = [
-			row({ text: "pet aa", translation: null }),
-			row({ text: "pet bbbb", translation: "  " }),
-			row({ text: "pet cccccc" }),
+			row({ text: "ne pet aa", translation: null }),
+			row({ text: "ne pet bbbb", translation: "  " }),
+			row({ text: "ne pet cccccc" }),
 		];
 		expect(selectExamples(rows, "pet").map((r) => r.text)).toEqual([
-			"pet cccccc",
+			"ne pet cccccc",
 		]);
 	});
 
 	test("prefers shorter sentences, up to the maximum", () => {
 		const rows = [
 			row({ text: "pet aaaa aaaa aaaa", dialect: "a" }),
-			row({ text: "pet bb", dialect: "b" }),
+			row({ text: "ne pet bb", dialect: "b" }),
 			row({ text: "pet cccc cccc", dialect: "c" }),
-			row({ text: "pet d", dialect: "d" }),
+			row({ text: "ne pet d", dialect: "d" }),
 		];
 		expect(selectExamples(rows, "pet", 3).map((r) => r.text)).toEqual([
-			"pet d",
-			"pet bb",
+			"ne pet d",
+			"ne pet bb",
 			"pet cccc cccc",
 		]);
 	});
 
 	test("ranks native-speaker attestations before modern composed texts", () => {
 		const rows = [
-			row({ text: "pet a", id: "ainu-times/019/2#1", dialect: "a" }),
-			row({ text: "pet bb", id: "zaidan-textbooks/x#1", dialect: "b" }),
+			row({ text: "ne pet a", id: "ainu-times/019/2#1", dialect: "a" }),
+			row({ text: "ne pet bb", id: "zaidan-textbooks/x#1", dialect: "b" }),
 			row({ text: "pet cccc cccc cccc", id: "aa-irc/013#3", dialect: "c" }),
 			row({ text: "pet dddd dddd", id: "nabesawa/001#5", dialect: "d" }),
 		];
@@ -654,10 +665,10 @@ describe("selectExamples", () => {
 
 	test("spreads picks across distinct dialect+document sources first", () => {
 		const rows = [
-			row({ text: "pet a", dialect: "小田洲", document: "人食いババ" }),
-			row({ text: "pet bb", dialect: "小田洲", document: "人食いババ" }),
-			row({ text: "pet cccc", dialect: "沙流", document: "uwepeker 8" }),
-			row({ text: "pet dddddd", dialect: "千歳", document: "kamuy yukar" }),
+			row({ text: "ne pet a", dialect: "小田洲", document: "人食いババ" }),
+			row({ text: "ne pet bb", dialect: "小田洲", document: "人食いババ" }),
+			row({ text: "ne pet cccc", dialect: "沙流", document: "uwepeker 8" }),
+			row({ text: "ne pet dddddd", dialect: "千歳", document: "kamuy yukar" }),
 		];
 		expect(selectExamples(rows, "pet", 3).map((r) => r.dialect)).toEqual([
 			"小田洲",
@@ -668,8 +679,8 @@ describe("selectExamples", () => {
 
 	test("falls back to repeated sources when distinct ones run out", () => {
 		const rows = [
-			row({ text: "pet a", dialect: "小田洲", document: "x" }),
-			row({ text: "pet bb", dialect: "小田洲", document: "x" }),
+			row({ text: "ne pet a", dialect: "小田洲", document: "x" }),
+			row({ text: "ne pet bb", dialect: "小田洲", document: "x" }),
 		];
 		expect(selectExamples(rows, "pet", 3)).toHaveLength(2);
 	});
@@ -849,9 +860,9 @@ describe("review follow-up regressions", () => {
 
 	test("a duplicated sentence keeps the copy from a not-yet-represented source", () => {
 		const rows = [
-			row({ text: "pet aa", document: "A" }),
-			row({ text: "pet bbb", document: "A" }),
-			row({ text: "pet bbb", document: "B", id: "b-copy" }),
+			row({ text: "ne pet aa", document: "A" }),
+			row({ text: "ne pet bbb", document: "A" }),
+			row({ text: "ne pet bbb", document: "B", id: "b-copy" }),
 		];
 		const picked = selectExamples(rows, "pet", 2);
 		expect(picked.map((r) => r.document)).toEqual(["A", "B"]);
@@ -859,17 +870,17 @@ describe("review follow-up regressions", () => {
 
 	test("dialect-only and document-only sources with the same name stay distinct", () => {
 		const rows = [
-			row({ text: "pet aa", dialect: "幌別" }),
-			row({ text: "pet bbb", document: "幌別" }),
+			row({ text: "ne pet aa", dialect: "幌別" }),
+			row({ text: "ne pet bbb", document: "幌別" }),
 		];
 		expect(selectExamples(rows, "pet", 2)).toHaveLength(2);
 	});
 
 	test("metadata-less rows share one diversity slot but still fill via fallback", () => {
 		const rows = [
-			row({ text: "pet aa", id: "1" }),
-			row({ text: "pet bbb", id: "2" }),
-			row({ text: "pet cccc", id: "3" }),
+			row({ text: "ne pet aa", id: "1" }),
+			row({ text: "ne pet bbb", id: "2" }),
+			row({ text: "ne pet cccc", id: "3" }),
 		];
 		expect(selectExamples(rows, "pet", 3)).toHaveLength(3);
 	});
@@ -888,7 +899,7 @@ describe("review follow-up regressions", () => {
 			gloss_jp: ["～をこねつぶす"],
 		});
 		const examples = [
-			row({ text: "kem nina", translation: "筋子をこねつぶす" }),
+			row({ text: "kem nina kor", translation: "筋子をこねつぶす" }),
 			row({ text: "semas nina poka", translation: "粗末な薪でも" }),
 		];
 		const sense = selectWotdSense("nina", wholeLookup([fire, mash]), examples);
@@ -908,7 +919,7 @@ describe("review follow-up regressions", () => {
 			gloss_jp: ["ヒラメ"],
 		});
 		const examples = [
-			row({ text: "nina ne", translation: "それだ" }),
+			row({ text: "nina ne na", translation: "それだ" }),
 			row({ text: "nina kusu paye", translation: "薪を採りに行った" }),
 		];
 		const sense = selectWotdSense("nina", wholeLookup([fire, flat]), examples);
@@ -918,7 +929,7 @@ describe("review follow-up regressions", () => {
 	test("a 2-char hiragana gloss run (する) no longer matches every translation", () => {
 		const doer = lex({ id: "a", lemma: "kar¹", gloss_jp: ["～する"] });
 		const maker = lex({ id: "b", lemma: "kar²", gloss_jp: ["～を作る"] });
-		const examples = [row({ text: "cise kar", translation: "家を作る" })];
+		const examples = [row({ text: "cise kar kor", translation: "家を作る" })];
 		const sense = selectWotdSense("kar", wholeLookup([doer, maker]), examples);
 		expect(sense).toEqual({ kind: "resolved", lexeme: maker });
 	});

@@ -165,7 +165,7 @@ const corpusRow = (
 });
 
 const DEFAULT_CORPUS_ROWS = [
-	corpusRow("s1", "utar okay.", "people are there."),
+	corpusRow("s1", "utar okay ruwe ne.", "people are there."),
 ];
 
 let corpusRows: unknown[] = DEFAULT_CORPUS_ROWS;
@@ -356,8 +356,8 @@ describe("runWotd", () => {
 			},
 		];
 		corpusRows = [
-			corpusRow("s1", "kamuy nomi.", "神に祈る。"),
-			corpusRow("s2", "sinep ne.", "一つである。"),
+			corpusRow("s1", "kamuy nomi ki.", "神に祈る。"),
+			corpusRow("s2", "sinep ne ruwe.", "一つである。"),
 		];
 		const db = new FakeD1();
 		db.rows.set(YESTERDAY, { date: YESTERDAY, token: "utar", posted: 1 });
@@ -378,7 +378,7 @@ describe("runWotd", () => {
 		const field = (name: string) =>
 			embed.fields.find((f) => f.name.includes(name))?.value;
 		expect(field("Meaning")).toStartWith("神 / god");
-		expect(field("Example")).toContain("kamuy nomi.");
+		expect(field("Example")).toContain("kamuy nomi ki.");
 		expect(embed.footer.text).toBe("mdb.aynu.org · corpus.aynu.org");
 		expect(db.rows.get(TODAY)?.token).toBe("kamuy");
 	});
@@ -389,9 +389,9 @@ describe("runWotd", () => {
 		// three before the meaning is checked holds none of the sentences that show
 		// 人々 — the day would post with no example at all.
 		corpusRows = [
-			corpusRow("s1", "utar ne.", "そうである。", "doc1"),
-			corpusRow("s2", "utar an.", "そこにある。", "doc2"),
-			corpusRow("s3", "utar ka.", "それもだ。", "doc3"),
+			corpusRow("s1", "utar ne ruwe.", "そうである。", "doc1"),
+			corpusRow("s2", "utar an ruwe.", "そこにある。", "doc2"),
+			corpusRow("s3", "utar ka ne.", "それもだ。", "doc3"),
 			corpusRow("s4", "utar opitta arpa.", "人々はみな行った。", "doc4"),
 		];
 		const db = new FakeD1();
@@ -409,7 +409,7 @@ describe("runWotd", () => {
 			f.name.includes("Example"),
 		)?.value;
 		expect(examples).toContain("utar opitta arpa.");
-		expect(examples).not.toContain("utar ne.");
+		expect(examples).not.toContain("utar ne ruwe.");
 	});
 
 	test("a re-fired cron trigger on the same JST day is a no-op (idempotent)", async () => {

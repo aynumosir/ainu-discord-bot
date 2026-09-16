@@ -35,7 +35,12 @@ import type { CronContext } from "discord-hono";
 import { $channels$_$messages } from "discord-hono";
 import { baseEmbed } from "../lib/embeds.js";
 import type { AppEnv } from "../lib/errors.js";
-import { normalizeAynu, textContainsToken, wotdKey } from "../lib/fold.js";
+import {
+	normalizeAynu,
+	splitAynuWords,
+	textContainsToken,
+	wotdKey,
+} from "../lib/fold.js";
 import { fnv1a } from "../lib/hash.js";
 import { truncate } from "../lib/truncate.js";
 import {
@@ -61,6 +66,10 @@ const MAX_PROBE = 20;
 // and gives `selectExamples` sources to spread across.
 const EXAMPLE_FETCH_LIMIT = 200;
 const EXAMPLE_MAX = 3;
+// A one- or two-word row is a dictionary headword or a gloss pair (鵡川's
+// 吉村冬子氏の言葉 lists `terke`「跳ねる」as a sentence of its own), which shows
+// the word without showing it in use.
+const EXAMPLE_MIN_WORDS = 3;
 const EXAMPLE_FIELD_MAX = 1024;
 // The lexeme search matches lemma, kana, variations and both gloss pools by
 // substring, ordered by recording count, so a short token is buried under the
@@ -227,7 +236,9 @@ function exampleSourceKey(row: CorpusRow): string {
  * Up to `max` example rows for `token`: only rows whose text contains `token`
  * as a whole word (the KWIC layer already matches whole tokens; the check is
  * kept so a fixture or a future source cannot slip a substring hit through)
- * and that carry a non-empty translation. Native-speaker attestations rank before modern composed texts
+ * that carry a non-empty translation, and that run to `EXAMPLE_MIN_WORDS` at
+ * least, so a headword copied from a word list is not the sentence shown.
+ * Native-speaker attestations rank before modern composed texts
  * (`exampleSourceTier`), shorter sentences before longer within a tier, and
  * rows from a dialect+document already represented are deferred until every
  * distinct source has one example, so a single narrator's tales don't fill
@@ -241,6 +252,7 @@ export function selectExamples(
 	const usable = rows
 		.filter((row) => row.translation != null && row.translation.trim() !== "")
 		.filter((row) => tokenAppearsInExample(row, token))
+		.filter((row) => wordCount(row.text) >= EXAMPLE_MIN_WORDS)
 		.sort(
 			(a, b) =>
 				exampleSourceTier(a) - exampleSourceTier(b) ||
@@ -361,6 +373,10 @@ function isProperNameLexeme(row: MdbLexemeSearchRow): boolean {
 	// char (apostrophe ’, digit, kana) — wrongly excluding those lemmas as
 	// proper names. Require an actual uppercase-letter initial instead.
 	return row.pos === "propn" || /^\p{Lu}/u.test(row.lemma);
+}
+
+function wordCount(text: string): number {
+	return splitAynuWords(text).filter((part) => part !== "").length;
 }
 
 function tokenAppearsInExample(
