@@ -18,9 +18,12 @@ export interface KwicLine {
 	left_text: string;
 	node_text: string;
 	right_text: string;
+	text: string;
 	translation: string | null;
 	dialect: string | null;
 	author: string | null;
+	collection: string | null;
+	document: string | null;
 	uri: string | null;
 }
 
@@ -76,6 +79,38 @@ export async function kwic(
 		{ total: number; offset: number; limit: number }
 	>(env, "CORPUS", `/v1/kwic?${query}`);
 	return { lines: data, meta: { total: meta?.total ?? data.length } };
+}
+
+/**
+ * The sentences that use `token` as a whole word, as `CorpusRow`s, via
+ * `/v1/kwic` — one per sentence, in corpus order. `/v1/search` is the wrong
+ * source for this: it matches substrings (`pet` finds `Yeepeta'usnaypo`) and
+ * reads the `corpus_fts` copy, whose translations lag the `sentences` table
+ * (`terke`: 0 of 40 rows translated there, 199 of 200 here). The token layer
+ * matches whole folded tokens and joins `sentences` directly.
+ */
+export async function tokenSentences(
+	env: Env,
+	opts: { q: string; limit?: number },
+): Promise<CorpusRow[]> {
+	// ctx=0 drops the neighbour token arrays; the sentence text is a field.
+	const { lines } = await kwic(env, { q: opts.q, ctx: 0, limit: opts.limit });
+	const rows = new Map<string, CorpusRow>();
+	for (const line of lines) {
+		// A sentence using the token twice yields two lines.
+		if (rows.has(line.sentence_id)) continue;
+		rows.set(line.sentence_id, {
+			id: line.sentence_id,
+			text: line.text,
+			translation: line.translation,
+			dialect: line.dialect,
+			author: line.author,
+			collection: line.collection,
+			document: line.document,
+			uri: line.uri,
+		});
+	}
+	return [...rows.values()];
 }
 
 export interface DialectNode {

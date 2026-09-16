@@ -11,10 +11,13 @@ const fixture: KwicLine[] = [
 		left_text: "a 'orowa taa 'inkara koh 'atuy kaawa sineh poro ",
 		node_text: "kamuy",
 		right_text: " yan manu.    sine poro kamuy yani ike, アノ hekac",
+		text: "a 'orowa taa 'inkara koh 'atuy kaawa sineh poro kamuy yan manu.    sine poro kamuy yani ike, アノ hekaci taa",
 		translation:
 			"行ってあたりを見ると、海原から一匹の大きなアザラシが上がって来たとさ。",
 		dialect: "小田洲",
 		author: "浅井 タケ",
+		collection: null,
+		document: null,
 		uri: "http://www.aa.tufs.ac.jp/~mmine/kiki_gen/murasaki/at01aj.html",
 	},
 	{
@@ -22,9 +25,12 @@ const fixture: KwicLine[] = [
 		left_text: "yan manu.    sine poro ",
 		node_text: "kamuy",
 		right_text: " yani ike, アノ hekaci taa",
+		text: "a 'orowa taa 'inkara koh 'atuy kaawa sineh poro kamuy yan manu.    sine poro kamuy yani ike, アノ hekaci taa",
 		translation: null,
 		dialect: null,
 		author: null,
+		collection: null,
+		document: null,
 		uri: null,
 	},
 ];

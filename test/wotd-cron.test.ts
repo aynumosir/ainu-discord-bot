@@ -3,6 +3,7 @@ import type { CronContext } from "discord-hono";
 import { createRest } from "discord-hono";
 import { postWotd, runWotd } from "../src/cron/wotd.js";
 import type { AppEnv } from "../src/lib/errors.js";
+import { textContainsToken } from "../src/lib/fold.js";
 
 const CORPUS_URL = "https://corpus.aynu.org";
 const MDB_URL = "https://mdb.aynu.org";
@@ -184,9 +185,25 @@ function stubFetch() {
 				JSON.stringify({ api_version: "1", data: FREQ_ROWS }),
 			);
 		}
-		if (url.startsWith(`${CORPUS_URL}/v1/search`)) {
+		if (url.startsWith(`${CORPUS_URL}/v1/kwic`)) {
+			// The token layer answers with one line per node token; the stub keeps
+			// only sentences that use the query as a whole word, as the API does.
+			const q = new URL(url).searchParams.get("q") ?? "";
+			const lines = (corpusRows as ReturnType<typeof corpusRow>[])
+				.filter((row) => textContainsToken(row.text, q))
+				.map(({ id, ...row }) => ({
+					sentence_id: id,
+					left_text: "",
+					node_text: q,
+					right_text: "",
+					...row,
+				}));
 			return new Response(
-				JSON.stringify({ api_version: "1", data: corpusRows }),
+				JSON.stringify({
+					api_version: "1",
+					data: lines,
+					meta: { total: lines.length, offset: 0, limit: 200 },
+				}),
 			);
 		}
 		if (url.startsWith(`${MDB_URL}/api/lexemes`)) {

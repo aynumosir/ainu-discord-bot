@@ -38,7 +38,11 @@ import type { AppEnv } from "../lib/errors.js";
 import { normalizeAynu, textContainsToken, wotdKey } from "../lib/fold.js";
 import { fnv1a } from "../lib/hash.js";
 import { truncate } from "../lib/truncate.js";
-import { type CorpusRow, freqList, searchCorpus } from "../services/corpus.js";
+import {
+	type CorpusRow,
+	freqList,
+	tokenSentences,
+} from "../services/corpus.js";
 import {
 	type GlossaryEntry,
 	type GlossaryTable,
@@ -52,7 +56,10 @@ const CANDIDATE_LIMIT = 400;
 const CANDIDATE_MIN_COUNT = 5;
 const RECENT_WINDOW_DAYS = 180;
 const MAX_PROBE = 20;
-const EXAMPLE_FETCH_LIMIT = 40;
+// KWIC lines come in sentence-id order, so a small window would hold one
+// collection's sentences only; 200 reaches past the alphabetically first ones
+// and gives `selectExamples` sources to spread across.
+const EXAMPLE_FETCH_LIMIT = 200;
 const EXAMPLE_MAX = 3;
 const EXAMPLE_FIELD_MAX = 1024;
 // The lexeme search matches lemma, kana, variations and both gloss pools by
@@ -218,9 +225,9 @@ function exampleSourceKey(row: CorpusRow): string {
 
 /**
  * Up to `max` example rows for `token`: only rows whose text contains `token`
- * as a whole word (the corpus search endpoint matches substrings, so `pet`
- * would otherwise surface `Yeepeta'usnaypo`) and that carry a non-empty
- * translation. Native-speaker attestations rank before modern composed texts
+ * as a whole word (the KWIC layer already matches whole tokens; the check is
+ * kept so a fixture or a future source cannot slip a substring hit through)
+ * and that carry a non-empty translation. Native-speaker attestations rank before modern composed texts
  * (`exampleSourceTier`), shorter sentences before longer within a tier, and
  * rows from a dialect+document already represented are deferred until every
  * distinct source has one example, so a single narrator's tales don't fill
@@ -1017,9 +1024,8 @@ async function enrichToken(
 	token: string,
 ): Promise<{ selection: WotdSelection; sense: WotdSense } | undefined> {
 	const entries = glossaryExactEntries(table, token);
-	const exampleRows = await searchCorpus(c.env, {
+	const exampleRows = await tokenSentences(c.env, {
 		q: token,
-		lang: "ain",
 		limit: EXAMPLE_FETCH_LIMIT,
 	});
 	const examples = selectExamples(exampleRows, token);
