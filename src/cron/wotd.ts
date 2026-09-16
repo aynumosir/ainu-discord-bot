@@ -50,7 +50,7 @@ import {
 	type WaitUntilCtx,
 } from "../services/glossary.js";
 import { type MdbLexemeSearchRow, searchLexemes } from "../services/mdb.js";
-import { allScripts, SCRIPT_LABELS, SCRIPTS } from "../services/script.js";
+import { allScripts, SCRIPTS } from "../services/script.js";
 
 const CANDIDATE_LIMIT = 400;
 const CANDIDATE_MIN_COUNT = 5;
@@ -634,9 +634,16 @@ function meaningOccursIn(meaning: string, ex: CorpusRow): boolean {
 	return glossWords(meaning).some((word) => words.has(word));
 }
 
-function scriptsFieldValue(token: string): string {
-	const { scripts } = allScripts(token);
-	return SCRIPTS.map((s) => `${SCRIPT_LABELS[s]}: ${scripts[s]}`).join("\n");
+/**
+ * The word in the scripts the title does not show, as a subtitle: the title is
+ * the Latin form, so `テㇾケ · тэркэ` beneath it says the rest without a label
+ * per line restating what a reader can see.
+ */
+function otherScriptsLine(token: string): string {
+	const { source, scripts } = allScripts(token);
+	return SCRIPTS.filter((s) => s !== source)
+		.map((s) => scripts[s])
+		.join(" · ");
 }
 
 function formatExample(row: CorpusRow): string {
@@ -907,15 +914,18 @@ export function wotdEmbed(
 		entry ? "itak.aynu.org" : undefined,
 		examples.length > 0 ? "corpus.aynu.org" : undefined,
 	].filter(Boolean);
+	// The word is the title — the largest text an embed can set — with the day
+	// above it in the small author line and its other scripts beneath it.
 	return baseEmbed(sources.join(" · "))
-		.title(
-			pastDate
-				? `📅 ${pastDate}のアイヌ語 / Word of the day, ${pastDate}: ${token}`
-				: `📅 今日のアイヌ語 / Word of the day: ${token}`,
-		)
+		.author({
+			name: pastDate
+				? `📅 ${pastDate}のアイヌ語 / Word of the day, ${pastDate}`
+				: "📅 今日のアイヌ語 / Word of the day",
+		})
+		.title(token)
+		.description(otherScriptsLine(token))
 		.fields(
 			{ name: "意味 / Meaning", value: meaning },
-			{ name: "表記 / Scripts", value: scriptsFieldValue(token) },
 			{ name: "例文 / Example", value: exampleFieldValue(examples) },
 		);
 }

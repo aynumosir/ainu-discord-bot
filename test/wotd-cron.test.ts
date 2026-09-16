@@ -264,9 +264,13 @@ describe("runWotd", () => {
 		await settle();
 
 		expect(discordPosts).toHaveLength(1);
-		const embed = (discordPosts[0] as { embeds: { title: string }[] })
-			.embeds[0];
-		expect(embed.title).toContain("Word of the day");
+		const embed = (
+			discordPosts[0] as {
+				embeds: { title: string; author: { name: string } }[];
+			}
+		).embeds[0];
+		expect(embed.author.name).toContain("Word of the day");
+		expect(embed.title).toBe("utar");
 
 		expect(db.rows.size).toBe(1);
 		const row = [...db.rows.values()][0];
@@ -485,10 +489,10 @@ describe("runWotd", () => {
 		});
 		// The word belongs to 2026-07-02, so the channel post says so instead of
 		// claiming to be today's.
-		const title = (discordPosts[0] as { embeds: { title: string }[] }).embeds[0]
-			?.title;
-		expect(title).toContain(YESTERDAY);
-		expect(title).not.toContain("今日");
+		const day = (discordPosts[0] as { embeds: { author: { name: string } }[] })
+			.embeds[0]?.author.name;
+		expect(day).toContain(YESTERDAY);
+		expect(day).not.toContain("今日");
 		// Recorded under the backfilled day; today is still open for the cron.
 		expect([...db.rows.keys()]).toEqual([YESTERDAY]);
 	});
