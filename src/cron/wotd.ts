@@ -542,6 +542,18 @@ export function selectWotdSense(
 	return resolvedOrAmbiguous(pooled.length === 1 ? pooled : commonRows);
 }
 
+/**
+ * Whether `selectWotdSense` could resolve anything at all for this lookup: a
+ * window that held every row, with at least one unbound exact lexeme in it.
+ */
+export function hasGlossableLexeme(
+	token: string,
+	lookup: { results: readonly MdbLexemeSearchRow[]; total: number },
+): boolean {
+	if (lookup.total > lookup.results.length) return false;
+	return exactLexemeRows(lookup.results, token).some((row) => !row.bound);
+}
+
 /** Resolved on exactly one candidate sense, ambiguous on any other count. */
 function resolvedOrAmbiguous(rows: readonly MdbLexemeSearchRow[]): WotdSense {
 	const sole = rows.length === 1 ? rows[0] : undefined;
@@ -893,7 +905,7 @@ export function wotdEmbed(
 	const sources = [
 		lexeme ? "mdb.aynu.org" : undefined,
 		entry ? "itak.aynu.org" : undefined,
-		"corpus.aynu.org",
+		examples.length > 0 ? "corpus.aynu.org" : undefined,
 	].filter(Boolean);
 	return baseEmbed(sources.join(" · "))
 		.title(
@@ -1024,12 +1036,18 @@ async function enrichToken(
 	token: string,
 ): Promise<{ selection: WotdSelection; sense: WotdSense } | undefined> {
 	const entries = glossaryExactEntries(table, token);
+	const lookup = await searchLexemes(c.env, token, MDB_LEXEME_LOOKUP_LIMIT);
+	// A token neither layer can gloss needs no sentences: most probes that end
+	// here are old romanisations (`shinuma`, `chisei`) MDB does not carry, and
+	// the corpus round trip is the larger of the two.
+	if (entries.length === 0 && !hasGlossableLexeme(token, lookup)) {
+		return undefined;
+	}
 	const exampleRows = await tokenSentences(c.env, {
 		q: token,
 		limit: EXAMPLE_FETCH_LIMIT,
 	});
 	const examples = selectExamples(exampleRows, token);
-	const lookup = await searchLexemes(c.env, token, MDB_LEXEME_LOOKUP_LIMIT);
 	const sense = selectWotdSense(token, lookup, examples);
 	// The row is chosen after the sense, so the sense the examples support is what
 	// decides which of the form's rows the embed prints.

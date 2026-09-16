@@ -1,10 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { formatKwicLines } from "../src/handlers/corpus.js";
-import type { KwicLine } from "../src/services/corpus.js";
+import { type KwicLine, tokenSentences } from "../src/services/corpus.js";
 
 // Fixture mirrors a trimmed live response from
 // `curl "https://corpus.aynu.org/v1/kwic?q=kamuy&ctx=6&limit=2&match=fold"`
-// (verified 2026-07-03), keeping only the fields formatKwicLines reads.
+// (verified 2026-07-03), keeping only the fields the bot's `KwicLine` types.
+// Both lines come from one sentence, as the token layer yields for a sentence
+// that uses the word twice.
 const fixture: KwicLine[] = [
 	{
 		sentence_id: "aa-asai/001#15",
@@ -70,5 +72,43 @@ describe("formatKwicLines", () => {
 
 	test("returns an empty string for no lines", () => {
 		expect(formatKwicLines([])).toBe("");
+	});
+});
+
+describe("tokenSentences", () => {
+	const originalFetch = globalThis.fetch;
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	test("one row per sentence, with the sentence's own provenance", async () => {
+		let requested = "";
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			requested = String(input);
+			return new Response(
+				JSON.stringify({
+					api_version: "1",
+					data: fixture,
+					meta: { total: 2, offset: 0, limit: 200 },
+				}),
+			);
+		}) as unknown as typeof fetch;
+		const env = { CORPUS_API_URL: "https://corpus.aynu.org" } as Env;
+
+		const rows = await tokenSentences(env, { q: "kamuy", limit: 200 });
+
+		const params = new URL(requested).searchParams;
+		expect(params.get("ctx")).toBe("0");
+		expect(params.get("match")).toBe("fold");
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({
+			id: "aa-asai/001#15",
+			text: fixture[0]?.text,
+			translation: fixture[0]?.translation,
+			dialect: "小田洲",
+			author: "浅井 タケ",
+			collection: null,
+			document: null,
+		});
 	});
 });

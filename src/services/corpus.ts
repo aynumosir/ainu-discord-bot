@@ -105,8 +105,9 @@ export async function tokenSentences(
 			translation: line.translation,
 			dialect: line.dialect,
 			author: line.author,
-			collection: line.collection,
-			document: line.document,
+			// Absent on a KWIC line from before the API carried them.
+			collection: line.collection ?? null,
+			document: line.document ?? null,
 			uri: line.uri,
 		});
 	}
