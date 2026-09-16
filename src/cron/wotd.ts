@@ -15,13 +15,17 @@
  *     A manual `/wotd` instead reposts that day's recorded word, and `date:`
  *     aims the whole pipeline at an earlier day the cron missed.
  *  3. sources candidates from `/v1/freq/list`, filters them, deterministically
- *     picks one by `fnv1a(date)`, probing forward for a glossary hit
- *  4. enriches with a glossary gloss, up to 3 whole-word corpus examples from
+ *     picks one by `fnv1a(date)`, probing forward for a token some layer can
+ *     give a meaning: an MDB lexeme the examples single out, or a glossary row
+ *  4. enriches with that meaning, up to 3 whole-word corpus examples from
  *     distinct sources, and all 3 supported scripts. A meaning and the sentences
  *     under it must belong to the same sense: the examples pick the MDB lexeme
- *     whose glosses they attest, and where they cannot pick one, only a sentence
- *     that shows the glossary meaning itself is kept. A candidate left with no
- *     sentence yields the day to one that reads whole.
+ *     whose glosses they attest, and where they cannot pick one, only a glossary
+ *     row may speak, and only a sentence that shows its meaning is kept. A
+ *     candidate left with no sentence yields the day to one that reads whole.
+ *     The glossary at itak.aynu.org is a terminology sheet, so most of the
+ *     corpus's commonest words (cise, wakka, seta…) have no row there; MDB is
+ *     the dictionary layer that covers them.
  *  5. posts an embed via the cron context's REST helper, then upserts the
  *     history row — only on a confirmed-successful post, so a failure never
  *     leaves a false "posted" row behind (the next day's run would still
@@ -877,10 +881,14 @@ export function wotdEmbed(
 	pastDate?: string,
 ) {
 	const meaning =
-		lexemeMeaning(lexeme, entry, examples) ??
-		glossaryMeaning(entry) ??
-		(entry ? "—" : "（辞書未登録 / not yet in the glossary）");
-	return baseEmbed("corpus.aynu.org · itak.aynu.org")
+		lexemeMeaning(lexeme, entry, examples) ?? glossaryMeaning(entry) ?? "—";
+	// The footer credits the layers this post drew on, and only those.
+	const sources = [
+		lexeme ? "mdb.aynu.org" : undefined,
+		entry ? "itak.aynu.org" : undefined,
+		"corpus.aynu.org",
+	].filter(Boolean);
+	return baseEmbed(sources.join(" · "))
 		.title(
 			pastDate
 				? `📅 ${pastDate}のアイヌ語 / Word of the day, ${pastDate}: ${token}`
@@ -996,10 +1004,12 @@ export interface WotdContext {
 
 /**
  * Everything the embed needs for one token — corpus examples, the MDB sense the
- * examples support, the glossary row — or `undefined` when the glossary has no
- * row for the token. A resolved sense headlines its MDB glosses and keeps every
- * example a rival sense does not claim; an unresolved one prints the glossary
- * row alone and keeps only the examples that corroborate it, which may be none.
+ * examples support, the glossary row — or `undefined` when no layer can vouch
+ * for a meaning: MDB carries no sense the examples single out, and the glossary
+ * has no row either. A resolved sense headlines its MDB glosses and keeps every
+ * example a rival sense does not claim, with or without a glossary row beside
+ * it; an unresolved one prints the glossary row alone and keeps only the
+ * examples that corroborate it, which may be none.
  */
 async function enrichToken(
 	c: WotdContext,
@@ -1007,8 +1017,6 @@ async function enrichToken(
 	token: string,
 ): Promise<{ selection: WotdSelection; sense: WotdSense } | undefined> {
 	const entries = glossaryExactEntries(table, token);
-	if (entries.length === 0) return undefined;
-
 	const exampleRows = await searchCorpus(c.env, {
 		q: token,
 		lang: "ain",
@@ -1024,22 +1032,35 @@ async function enrichToken(
 		sense.kind === "resolved" ? sense.lexeme : undefined,
 		examples,
 	);
+	if (sense.kind === "resolved") {
+		return {
+			selection: {
+				token,
+				entry,
+				examples: filterExamplesBySense(
+					examples,
+					sense.lexeme,
+					lookup.results,
+					token,
+				),
+				lexeme: sense.lexeme,
+			},
+			sense,
+		};
+	}
 	if (!entry) return undefined;
 	return {
 		selection: {
 			token,
 			entry,
-			examples:
-				sense.kind === "resolved"
-					? filterExamplesBySense(examples, sense.lexeme, lookup.results, token)
-					: // The corroborating sentences are chosen from everything the corpus
-						// returned, so `selectExamples` still ranks by source and length
-						// among them; `examples` above only had to decide the sense.
-						selectExamples(
-							filterExamplesByMeaning(exampleRows, entryMeanings(entry)),
-							token,
-						),
-			lexeme: sense.kind === "resolved" ? sense.lexeme : undefined,
+			// The corroborating sentences are chosen from everything the corpus
+			// returned, so `selectExamples` still ranks by source and length among
+			// them; `examples` above only had to decide the sense.
+			examples: selectExamples(
+				filterExamplesByMeaning(exampleRows, entryMeanings(entry)),
+				token,
+			),
+			lexeme: undefined,
 		},
 		sense,
 	};
@@ -1109,7 +1130,7 @@ export async function postWotd(
 		if (!enriched) {
 			return {
 				status: "skipped",
-				reason: `${posted} has no glossary row to rebuild from`,
+				reason: `${posted} has no meaning in MDB or the glossary to rebuild from`,
 			};
 		}
 		await publish(c, channelId, enriched.selection, pastDate);
@@ -1142,7 +1163,9 @@ export async function postWotd(
 	// post, so it is kept in reserve while the probe looks for one that reads
 	// whole: an MDB sense first, then any candidate at all. Preferring an example
 	// is what keeps the meaning-corroboration gate from thinning the posts —
-	// a word the gate strips bare yields the day to one it does not.
+	// a word the gate strips bare yields the day to one it does not. A token no
+	// layer can gloss (an old romanisation such as `shinuma`, a form MDB lacks) is
+	// skipped outright.
 	let senseWithoutExample: WotdSelection | undefined;
 	let lastResort: WotdSelection | undefined;
 	const probes = Math.min(MAX_PROBE, candidates.length);
@@ -1168,7 +1191,10 @@ export async function postWotd(
 	}
 	selected ??= senseWithoutExample ?? lastResort;
 	if (!selected) {
-		return { status: "skipped", reason: "no glossary-backed candidate at all" };
+		return {
+			status: "skipped",
+			reason: "no candidate has a meaning in MDB or the glossary",
+		};
 	}
 	if (selected.examples.length === 0) {
 		console.warn(

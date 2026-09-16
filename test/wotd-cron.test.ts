@@ -190,12 +190,18 @@ function stubFetch() {
 			);
 		}
 		if (url.startsWith(`${MDB_URL}/api/lexemes`)) {
+			// The live endpoint matches by substring; the stub keeps only the rows
+			// whose lemma is the query, so each token sees its own lexemes.
+			const q = new URL(url).searchParams.get("q");
+			const results = (mdbLexemeResults as { lemma: string }[]).filter(
+				(row) => row.lemma === q,
+			);
 			return new Response(
 				JSON.stringify({
-					query: "utar",
-					total: mdbLexemeResults.length,
-					returned: mdbLexemeResults.length,
-					results: mdbLexemeResults,
+					query: q,
+					total: results.length,
+					returned: results.length,
+					results,
 				}),
 			);
 		}
@@ -305,6 +311,55 @@ describe("runWotd", () => {
 		expect(db.rows.size).toBe(1);
 		expect([...db.rows.values()][0].posted).toBe(1);
 		expect([...db.rows.values()][0].token).toBe("utar");
+	});
+
+	test("a word the glossary lacks still posts from its MDB lexeme", async () => {
+		stubFetch();
+		// `utar` is out of the way in the recency window, and neither `kamuy` nor
+		// `sinep` has a glossary row: before MDB counted as a meaning layer the day
+		// went out as "nothing to post", though MDB glosses both. The one whose
+		// sentence attests its gloss is the one that reads whole.
+		mdbLexemeResults = [
+			{
+				id: "kamuy.n",
+				lemma: "kamuy",
+				kana: "カムイ",
+				pos: "n",
+				gloss_en: ["god"],
+				gloss_jp: ["神"],
+				bound: false,
+				dialects: [],
+				variations: [],
+				recordings: 3,
+				morphemes: [],
+			},
+		];
+		corpusRows = [
+			corpusRow("s1", "kamuy nomi.", "神に祈る。"),
+			corpusRow("s2", "sinep ne.", "一つである。"),
+		];
+		const db = new FakeD1();
+		db.rows.set(YESTERDAY, { date: YESTERDAY, token: "utar", posted: 1 });
+		const { c, settle } = makeContext(makeEnv(db, new MemoryKV()));
+
+		await runWotd(c, NOW);
+		await settle();
+
+		expect(discordPosts).toHaveLength(1);
+		const embed = (
+			discordPosts[0] as {
+				embeds: {
+					footer: { text: string };
+					fields: { name: string; value: string }[];
+				}[];
+			}
+		).embeds[0];
+		const field = (name: string) =>
+			embed.fields.find((f) => f.name.includes(name))?.value;
+		expect(field("Meaning")).toStartWith("神 / god");
+		expect(field("Example")).toContain("kamuy nomi.");
+		expect(embed.footer.text).toBe("mdb.aynu.org · corpus.aynu.org");
+		expect(db.rows.get(TODAY)?.token).toBe("kamuy");
 	});
 
 	test("an unresolved sense takes its examples from the whole corpus pool", async () => {
@@ -475,16 +530,16 @@ describe("runWotd", () => {
 		await today.settle();
 		expect([...db.rows.values()][0]?.token).toBe("utar");
 
-		// `utar` is the fixture's only glossary-backed candidate and it is now in
-		// the recency window, so the earlier day finds nothing to post rather than
-		// repeating it.
+		// `utar` is the fixture's only candidate any layer can gloss and it is now
+		// in the recency window, so the earlier day finds nothing to post rather
+		// than repeating it.
 		const earlier = makeContext(makeEnv(db, kv));
 		const outcome = await postWotd(earlier.c, { now: NOW, date: YESTERDAY });
 		await earlier.settle();
 
 		expect(outcome).toEqual({
 			status: "skipped",
-			reason: "no glossary-backed candidate at all",
+			reason: "no candidate has a meaning in MDB or the glossary",
 		});
 		expect(discordPosts).toHaveLength(1);
 		expect([...db.rows.keys()]).toEqual([TODAY]);
