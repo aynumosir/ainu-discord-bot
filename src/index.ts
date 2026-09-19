@@ -66,10 +66,10 @@ export default {
 		env: AppEnv["Bindings"],
 		executionCtx: ExecutionContext,
 	) {
-		if (request.method === "GET") {
+		if (request.method === "GET" || request.method === "HEAD") {
 			const { pathname } = new URL(request.url);
 			if (pathname === "/") {
-				return new Response(LANDING_HTML, {
+				return new Response(request.method === "HEAD" ? null : LANDING_HTML, {
 					headers: {
 						"content-type": "text/html; charset=utf-8",
 						"X-Robots-Tag": "noindex",
